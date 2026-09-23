@@ -11,5 +11,7 @@ bridge = "br0" # Replace with a bridge that exists on this host.
 
 [netbox]
 url = "https://netbox.example.org" # Replace when NetBox mode is enabled.
-key = "" # Empty means local-only mode; set only in untracked config.toml, then chmod 600.
-device = "hypervisor-01" # Required with a key: existing NetBox device name or numeric ID.
+key = "" # Optional: leave empty when using netbox.key file or NETBOX_TOKEN.
+device = "hypervisor-01" # Name of a device already created in NetBox.
+site = "" # Site slug; set when the device name exists at several sites.
+tenant = "" # Tenant slug; set only if name and site are still ambiguous.

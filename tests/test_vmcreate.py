@@ -92,6 +92,32 @@ class CreationTests(unittest.TestCase):
 
 
 class NetBoxTests(unittest.TestCase):
+    def test_token_file_enables_netbox_and_requires_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = Path(directory) / "netbox.key"
+            key.write_text("nbt_example\n", encoding="utf-8")
+            config = {"netbox": {"url": "https://netbox.example.org", "key": ""}}
+            with patch.object(netbox, "KEY_FILE", key):
+                key.chmod(0o644)
+                self.assertTrue(netbox.has_netbox_key(config))
+                with self.assertRaisesRegex(netbox.NetBoxError, "chmod 600"):
+                    netbox._settings(config)
+                key.chmod(0o600)
+                self.assertEqual(netbox._settings(config), ("https://netbox.example.org", "nbt_example"))
+
+    def test_same_device_name_is_disambiguated_by_site(self):
+        devices = {"results": [
+            {"id": 12, "name": "hypervisor-01", "site": {"slug": "site-a"}, "cluster": {"id": 7}},
+            {"id": 13, "name": "hypervisor-01", "site": {"slug": "site-b"}, "cluster": {"id": 8}},
+        ]}
+        with patch("netbox._request", return_value=devices):
+            with self.assertRaisesRegex(netbox.NetBoxError, "netbox.site"):
+                netbox.find_device({"netbox": {"device": "hypervisor-01"}})
+            self.assertEqual(
+                netbox.find_device({"netbox": {"device": "hypervisor-01", "site": "site-b"}}),
+                (13, 8),
+            )
+
     def test_paginated_inventory_keeps_only_host_vms(self):
         config = {"netbox": {"url": "https://netbox.example", "key": "secret"}}
         with (

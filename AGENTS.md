@@ -1,6 +1,6 @@
 # vmctl project rules
 
-- With a NetBox key configured, NetBox is the source of truth for VM definitions and desired state.
+- With a NetBox key configured inline, in the local netbox.key file, or via NETBOX_TOKEN, NetBox is the source of truth for VM definitions and desired state.
 - In that managed mode, every VM create or state-changing command must write NetBox before changing local libvirt state. If the NetBox write fails, do not run the local mutation.
 - Without a NetBox key, commands are local only and must never read or write NetBox. NetBox audit, adoption and sync require a key.
 - After a VM is recorded in NetBox, read its standard VM fields and `local_context_data.vmctl` to construct or reconcile the local VM. TOML input is a request, not an authoritative copy.
