@@ -304,13 +304,29 @@ def main() -> int:
                 desired_status = desired_status.get("value")
             if desired_status not in ("planned", "staged", "offline", "active"):
                 raise NetBoxError(f"VM has unsupported NetBox status: {desired_status!r}")
-            if args.command == "sync" and not args.dry_run:
+            if args.command == "sync":
                 existing = subprocess.run(
                     ["virsh", "-c", config["host"]["libvirt_uri"], "list", "--all", "--name"],
                     check=True, capture_output=True, text=True,
                 )
                 if vm["name"] in existing.stdout.splitlines():
                     verify_local_vm(vm, config)
+                    if args.dry_run:
+                        print(f"Local VM definition matches NetBox: {vm['name']}")
+                        if desired_status == "planned":
+                            print(f"NetBox: stage {vm['name']}")
+                        if desired_status in ("active", "offline"):
+                            state = subprocess.run(
+                                ["virsh", "-c", config["host"]["libvirt_uri"], "domstate", vm["name"]],
+                                check=True, capture_output=True, text=True,
+                            ).stdout.strip()
+                            power_command = "start" if desired_status == "active" and state == "shut off" else (
+                                "shutdown" if desired_status == "offline" and state == "running" else None
+                            )
+                            if power_command:
+                                print(f"NetBox: set {vm['name']} status to {desired_status}")
+                                print(shlex.join(["virsh", "-c", config["host"]["libvirt_uri"], power_command, vm["name"]]))
+                        return 0
                     if desired_status == "planned":
                         patch_vm(config, record["id"], {"status": "staged"})
                     reconcile_power(config, record, desired_status)

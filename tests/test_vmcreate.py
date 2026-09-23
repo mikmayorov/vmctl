@@ -371,6 +371,33 @@ class OperationOrderTests(unittest.TestCase):
             self.assertEqual(vmctl.main(), 0)
         self.assertEqual(order, ["netbox", "local", "netbox"])
 
+    def test_dry_run_sync_existing_vm_does_not_plan_creation(self):
+        args = Namespace(command="sync", vm="test-vm", config=Path("config.toml"), dry_run=True)
+        config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
+        record = {"id": 42, "name": "test-vm", "status": {"value": "active"}}
+        plan = {"name": "test-vm", "source": "iso", "memory_mb": 2048,
+                "vcpus": 2, "disk_gb": 20, "iso": "/images/install.iso"}
+
+        def local(command, **kwargs):
+            return SimpleNamespace(stdout="shut off\n" if "domstate" in command else "test-vm\n")
+
+        with (
+            patch("vmctl.parse_args", return_value=args),
+            patch("vmctl.load_config", return_value=config),
+            patch("vmctl.find_device", return_value=(12, 7)),
+            patch("vmctl.get_vm", return_value=record),
+            patch("vmctl.local_spec_from_netbox", return_value=plan),
+            patch("vmctl.verify_local_vm") as verify,
+            patch("vmctl.create_vm") as create,
+            patch("vmctl.subprocess.run", side_effect=local),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(vmctl.main(), 0)
+        verify.assert_called_once()
+        create.assert_not_called()
+        self.assertIn("Local VM definition matches NetBox", output.getvalue())
+        self.assertIn("virsh -c qemu:///system start test-vm", output.getvalue())
+
     def test_start_does_not_run_virsh_when_netbox_fails(self):
         args = Namespace(command="start", vm="test-vm", config=Path("config.toml"), dry_run=False)
         config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
