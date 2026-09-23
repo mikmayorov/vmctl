@@ -114,17 +114,20 @@ def audit(config: dict) -> int:
             if status in ("active", "offline"):
                 expected["status"] = status
             context = (vm.get("local_context_data") or {}).get("vmctl") or {}
-            if context.get("version") != 1 or context.get("source") not in ("iso", "cloud_image", "existing"):
-                raise ValueError("NetBox VM has no supported vmctl context")
-            if context.get("bridge") is not None:
-                expected["bridge"] = context["bridge"]
-            if context.get("disk_paths") is not None:
-                expected["disk_paths"] = context["disk_paths"]
-            elif context["source"] in ("iso", "cloud_image"):
-                directory = context.get("storage_directory")
-                if not isinstance(directory, str):
-                    raise ValueError("NetBox VM has no storage_directory")
-                expected["disk_paths"] = [str(Path(directory) / f"{name}.qcow2")]
+            supported_context = context.get("version") == 1 and context.get("source") in ("iso", "cloud_image", "existing")
+            if not supported_context:
+                print(f"INVALID {name}: NetBox VM has no supported vmctl context")
+                problems += 1
+            else:
+                if context.get("bridge") is not None:
+                    expected["bridge"] = context["bridge"]
+                if context.get("disk_paths") is not None:
+                    expected["disk_paths"] = context["disk_paths"]
+                elif context["source"] in ("iso", "cloud_image"):
+                    directory = context.get("storage_directory")
+                    if not isinstance(directory, str):
+                        raise ValueError("NetBox VM has no storage_directory")
+                    expected["disk_paths"] = [str(Path(directory) / f"{name}.qcow2")]
             for field, wanted in expected.items():
                 if local[field] != wanted:
                     print(f"DIFF {name} {field}: NetBox={wanted!r} local={local[field]!r}")

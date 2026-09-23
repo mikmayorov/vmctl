@@ -266,6 +266,26 @@ class OperationOrderTests(unittest.TestCase):
         self.assertIn("MISSING NETBOX: local", output.getvalue())
         self.assertIn("MISSING LOCAL: remote", output.getvalue())
 
+    def test_audit_compares_standard_fields_without_vmctl_context(self):
+        config = {"netbox": {"key": "secret"}}
+        remote = {"name": "old", "vcpus": 2, "memory": 2048, "disk": 10240,
+                  "status": {"value": "active"}, "start_on_boot": {"value": "on"}}
+        local = {"vcpus": 4, "memory_mb": 4096, "disk_mb": 20480,
+                 "status": "active", "autostart": True}
+        with (
+            patch("vmctl.find_device", return_value=(12, 7)),
+            patch("vmctl.list_vms", return_value=[remote]),
+            patch("vmctl.local_names", return_value=["old"]),
+            patch("vmctl.inspect_vm", return_value=local),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(vmctl.audit(config), 1)
+        report = output.getvalue()
+        self.assertIn("INVALID old: NetBox VM has no supported vmctl context", report)
+        self.assertIn("DIFF old vcpus:", report)
+        self.assertIn("DIFF old memory_mb:", report)
+        self.assertIn("DIFF old disk_mb:", report)
+
     def test_reconcile_power_writes_netbox_before_start(self):
         order = []
         config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
