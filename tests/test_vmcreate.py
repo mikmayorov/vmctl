@@ -1,5 +1,6 @@
 import contextlib
 import io
+import subprocess
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -16,6 +17,14 @@ from vmcreate import create_vm, domain_xml, validate_spec, verify_local_vm
 
 
 class CreationTests(unittest.TestCase):
+    def test_vmctl_entrypoint_runs_through_installed_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            link = Path(directory) / "vmctl"
+            link.symlink_to(Path(__file__).resolve().parents[1] / "vmctl")
+            result = subprocess.run([str(link), "--help"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage: vmctl", result.stdout)
+
     def setUp(self):
         self.vm = validate_spec({"vm": {
             "name": "test-vm", "source": "iso", "memory_mb": 2048,

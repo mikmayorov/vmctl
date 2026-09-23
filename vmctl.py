@@ -328,7 +328,7 @@ def main() -> int:
             if has_netbox_key(config):
                 print("NetBox remains the source of truth; inspect its VM record before retrying.", file=sys.stderr)
             if reserved_name:
-                print(f"Retry: python3 vmctl.py sync {reserved_name}", file=sys.stderr)
+                print(f"Retry: vmctl sync {reserved_name}", file=sys.stderr)
             return 1
         return 0
 

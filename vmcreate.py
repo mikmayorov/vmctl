@@ -180,5 +180,5 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
     with xml_path.open("x", encoding="utf-8") as file:
         file.write(domain_xml(vm, disk, bridge, seed))
     subprocess.run(define_cmd, check=True)
-    print(f"VM defined: {vm['name']}. Start it with: python3 vmctl.py start {vm['name']}")
+    print(f"VM defined: {vm['name']}. Start it with: vmctl start {vm['name']}")
     return 0
