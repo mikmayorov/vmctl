@@ -1,0 +1,15 @@
+[host]
+libvirt_uri = "qemu:///system"
+
+[storage]
+# Replace with the disk directory on this host. New VM requests copy it to NetBox.
+directory = "/var/lib/libvirt/images"
+
+[network]
+# Default for a new request; each VM's selected bridge is stored in NetBox.
+bridge = "br0" # Replace with a bridge that exists on this host.
+
+[netbox]
+url = "https://netbox.example.org" # Replace when NetBox mode is enabled.
+key = "" # Empty means local-only mode; set only in untracked config.toml, then chmod 600.
+device = "hypervisor-01" # Required with a key: existing NetBox device name or numeric ID.

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+config.toml
+state/
+local/
+*.log
+*.qcow2
+*.img
+*.iso

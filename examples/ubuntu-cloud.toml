@@ -1,0 +1,8 @@
+[vm]
+name = "example-cloud"
+source = "cloud_image"
+memory_mb = 2048
+vcpus = 2
+disk_gb = 20
+image = "/var/lib/libvirt/images/base-cloud.img" # Replace with a cloud image on this host.
+user_data = "/opt/vmctl/examples/user-data.yaml"
