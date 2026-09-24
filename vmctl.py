@@ -10,11 +10,11 @@ import tomllib
 from pathlib import Path
 
 from netbox import (
-    NetBoxError, find_device, find_vm, get_vm, has_netbox_key, import_vm, list_vms,
+    NetBoxError, create_vm_components, find_device, find_vm, get_vm, has_netbox_key, import_vm, list_vms,
     local_spec_from_netbox, patch_vm, reserve_vm,
 )
 from inventory import inspect_vm, local_names
-from vmcreate import create_vm, validate_spec, verify_local_vm
+from vmcreate import create_vm, redefine_vm, validate_spec, verify_local_vm
 
 
 DEFAULT_CONFIG = Path(__file__).with_name("config.toml")
@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("create", help="define a new VM from ISO or cloud image")
     create.add_argument("spec", type=Path, help="TOML VM specification")
+    prepare = commands.add_parser("prepare", help="create VM, disk and interface in NetBox before local provisioning")
+    prepare.add_argument("spec", type=Path, help="TOML VM specification")
     sync = commands.add_parser("sync", help="apply a VM definition from NetBox locally")
     sync.add_argument("vm", help="VM name in NetBox")
     commands.add_parser("doctor", help="check local tools and NetBox host configuration")
@@ -114,11 +116,19 @@ def audit(config: dict) -> int:
             if status in ("active", "offline"):
                 expected["status"] = status
             context = (vm.get("local_context_data") or {}).get("vmctl") or {}
-            supported_context = context.get("version") == 1 and context.get("source") in ("iso", "cloud_image", "existing")
+            supported_context = context.get("version") in (1, 2) and context.get("source") in ("iso", "cloud_image", "existing")
             if not supported_context:
                 print(f"INVALID {name}: NetBox VM has no supported vmctl context")
                 problems += 1
             else:
+                if context["version"] == 2:
+                    try:
+                        spec = local_spec_from_netbox(vm, config)
+                        expected.update({field: spec[field] for field in ("description", "display")})
+                        expected["mac_address"] = spec["mac_address"].lower()
+                    except NetBoxError as error:
+                        print(f"INVALID {name}: {error}")
+                        problems += 1
                 if context.get("bridge") is not None:
                     expected["bridge"] = context["bridge"]
                 if context.get("disk_paths") is not None:
@@ -129,8 +139,12 @@ def audit(config: dict) -> int:
                         raise ValueError("NetBox VM has no storage_directory")
                     expected["disk_paths"] = [str(Path(directory) / f"{name}.qcow2")]
             for field, wanted in expected.items():
-                if local[field] != wanted:
-                    print(f"DIFF {name} {field}: NetBox={wanted!r} local={local[field]!r}")
+                observed = local[field].lower() if field == "mac_address" and local[field] else local[field]
+                if observed != wanted:
+                    if field == "display":
+                        print(f"DIFF {name} display: NetBox and local XML differ (password redacted)")
+                    else:
+                        print(f"DIFF {name} {field}: NetBox={wanted!r} local={observed!r}")
                     problems += 1
         except (ValueError, KeyError, subprocess.CalledProcessError) as error:
             print(f"INVALID {name}: {error}")
@@ -249,12 +263,14 @@ def main() -> int:
             print(f"{args.command} failed: {error}", file=sys.stderr)
             return 1
 
-    if args.command in ("create", "sync"):
+    if args.command in ("create", "prepare", "sync"):
         reserved_name = None
         try:
-            if args.command == "create":
+            if args.command in ("create", "prepare"):
                 with args.spec.open("rb") as file:
                     request_vm = validate_spec(tomllib.load(file))
+                if args.command == "prepare":
+                    require_netbox(config)
                 if not has_netbox_key(config):
                     plan = {
                         **request_vm,
@@ -264,6 +280,9 @@ def main() -> int:
                     return create_vm(plan, config, Path(__file__).parent, args.dry_run)
                 if args.dry_run:
                     print(f"NetBox: create planned VM {request_vm['name']} on device {config['netbox']['device']}")
+                    print(f"NetBox: create virtual disk, interface {request_vm.get('interface_name', 'inet')} and primary MAC")
+                    if args.command == "prepare":
+                        return 0
                     plan = {
                         **request_vm,
                         "bridge": config["network"]["bridge"],
@@ -271,9 +290,24 @@ def main() -> int:
                     }
                     return create_vm(plan, config, Path(__file__).parent, True)
                 device_id, cluster_id = find_device(config)
-                reserve_vm(config, request_vm, cluster_id, device_id)
+                if args.command == "prepare":
+                    existing = find_vm(config, request_vm["name"], cluster_id)
+                    if existing:
+                        record = get_vm(config, request_vm["name"], cluster_id, device_id)
+                        context = (record.get("local_context_data") or {}).get("vmctl") or {}
+                        if context.get("version") != 2 or context.get("source") != request_vm["source"]:
+                            raise NetBoxError("existing NetBox VM does not match this preparation request")
+                    else:
+                        reserve_vm(config, request_vm, cluster_id, device_id)
+                        record = get_vm(config, request_vm["name"], cluster_id, device_id)
+                else:
+                    reserve_vm(config, request_vm, cluster_id, device_id)
+                    record = get_vm(config, request_vm["name"], cluster_id, device_id)
                 reserved_name = request_vm["name"]
-                record = get_vm(config, request_vm["name"], cluster_id, device_id)
+                create_vm_components(config, record, request_vm.get("interface_name", "inet"))
+                if args.command == "prepare":
+                    print(f"Prepared in NetBox: {request_vm['name']}. Set IPs and display, then run: vmctl sync {request_vm['name']}")
+                    return 0
             else:
                 require_netbox(config)
                 device_id, cluster_id = find_device(config)
@@ -292,13 +326,20 @@ def main() -> int:
                 for field in ("bridge", "disk_paths"):
                     if context.get(field) != local[field]:
                         raise NetBoxError(f"adopted VM {field} differs from NetBox; run audit")
+                if context.get("version") == 2:
+                    documented = local_spec_from_netbox(record, config)
+                    for field in ("description", "display"):
+                        if documented[field] != local[field]:
+                            raise NetBoxError(f"adopted VM {field} differs from NetBox; run audit")
+                    if documented["mac_address"].lower() != (local["mac_address"] or "").lower():
+                        raise NetBoxError("adopted VM MAC differs from NetBox; run audit")
                 status = record.get("status")
                 status = status.get("value") if isinstance(status, dict) else status
                 if not args.dry_run:
                     reconcile_power(config, record, status)
                 print(f"Adopted local VM matches NetBox sizing: {args.vm}")
                 return 0
-            vm = validate_spec({"vm": local_spec_from_netbox(record)})
+            vm = validate_spec({"vm": local_spec_from_netbox(record, config)})
             desired_status = record.get("status")
             if isinstance(desired_status, dict):
                 desired_status = desired_status.get("value")
@@ -310,9 +351,20 @@ def main() -> int:
                     check=True, capture_output=True, text=True,
                 )
                 if vm["name"] in existing.stdout.splitlines():
-                    verify_local_vm(vm, config)
+                    changed = False
+                    try:
+                        verify_local_vm(vm, config)
+                    except ValueError:
+                        context = (record.get("local_context_data") or {}).get("vmctl") or {}
+                        if context.get("version") != 2:
+                            raise
+                        redefine_vm(vm, config, Path(__file__).parent, args.dry_run)
+                        changed = True
+                        if not args.dry_run:
+                            verify_local_vm(vm, config)
                     if args.dry_run:
-                        print(f"Local VM definition matches NetBox: {vm['name']}")
+                        if not changed:
+                            print(f"Local VM definition matches NetBox: {vm['name']}")
                         if desired_status == "planned":
                             print(f"NetBox: stage {vm['name']}")
                         if desired_status in ("active", "offline"):

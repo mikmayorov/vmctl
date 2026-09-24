@@ -2,6 +2,7 @@
 
 import json
 import os
+import secrets
 from pathlib import Path
 from decimal import Decimal, InvalidOperation
 import urllib.error
@@ -129,6 +130,56 @@ def list_vms(config: dict, device_id: int) -> list[dict]:
             isinstance(vm.get("device"), dict) and vm["device"].get("id") == device_id]
 
 
+def vm_disks(config: dict, vm_id: int) -> list[dict]:
+    return _list_results(config, f"virtualization/virtual-disks/?virtual_machine_id={vm_id}&limit=100")
+
+
+def vm_interfaces(config: dict, vm_id: int) -> list[dict]:
+    return _list_results(config, f"virtualization/interfaces/?virtual_machine_id={vm_id}&limit=100")
+
+
+def interface_ips(config: dict, interface_id: int) -> list[dict]:
+    return _list_results(config, "ipam/ip-addresses/?" + urllib.parse.urlencode({
+        "assigned_object_type": "virtualization.vminterface",
+        "assigned_object_id": interface_id, "limit": 100,
+    }))
+
+
+def create_vm_components(config: dict, record: dict, interface_name: str = "inet", mac: str | None = None) -> None:
+    """Create the NetBox disk, interface and primary MAC before local provisioning."""
+    vm_id = record["id"]
+    disks = vm_disks(config, vm_id)
+    if not disks:
+        _request(config, "POST", "virtualization/virtual-disks/", {
+            "virtual_machine": vm_id, "name": record["name"], "size": int(record["disk"]),
+        })
+    elif len(disks) != 1 or disks[0]["name"] != record["name"] or int(disks[0]["size"]) != int(record["disk"]):
+        raise NetBoxError(f"NetBox disks for {record['name']} differ from the VM request")
+    interfaces = vm_interfaces(config, vm_id)
+    if not interfaces:
+        interface = _request(config, "POST", "virtualization/interfaces/", {
+            "virtual_machine": vm_id, "name": interface_name, "enabled": True,
+        })
+    elif len(interfaces) == 1 and interfaces[0]["name"] == interface_name:
+        interface = interfaces[0]
+    else:
+        raise NetBoxError(f"NetBox interfaces for {record['name']} differ from the VM request")
+    primary = interface.get("primary_mac_address")
+    if not primary:
+        if mac is None:
+            suffix = secrets.token_bytes(3)
+            mac = "52:54:00:" + ":".join(f"{byte:02X}" for byte in suffix)
+        created = _request(config, "POST", "dcim/mac-addresses/", {
+            "mac_address": mac, "assigned_object_type": "virtualization.vminterface",
+            "assigned_object_id": interface["id"],
+        })
+        _request(config, "PATCH", f"virtualization/interfaces/{interface['id']}/", {
+            "primary_mac_address": created["id"],
+        })
+    elif mac and primary["mac_address"].lower() != mac.lower():
+        raise NetBoxError(f"NetBox MAC for {record['name']} differs from the local VM")
+
+
 def _list_results(config: dict, path: str) -> list[dict]:
     records = []
     while path:
@@ -148,18 +199,24 @@ def _list_results(config: dict, path: str) -> list[dict]:
 
 def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     """Document a pre-existing local VM without changing libvirt."""
+    if len(vm["disk_paths"]) != 1 or not vm.get("mac_address"):
+        raise NetBoxError(f"VM {vm['name']} needs one disk and one interface with MAC for adoption")
     payload = {
         "name": vm["name"], "cluster": cluster_id, "device": device_id,
         "status": vm["status"], "vcpus": vm["vcpus"],
         "memory": vm["memory_mb"], "disk": vm["disk_mb"],
+        "description": vm.get("description", ""),
         "start_on_boot": "on" if vm["autostart"] else "off",
         "local_context_data": {"vmctl": {
-            "version": 1, "source": "existing", "bridge": vm.get("bridge"),
+            "version": 2, "source": "existing", "bridge": vm.get("bridge"),
             "disk_paths": vm["disk_paths"],
+            "interface_name": "inet", "display": vm.get("display"),
         }},
         "changelog_message": "Imported existing libvirt VM with vmctl",
     }
-    return _request(config, "POST", "virtualization/virtual-machines/", payload)
+    record = _request(config, "POST", "virtualization/virtual-machines/", payload)
+    create_vm_components(config, record, "inet", vm.get("mac_address"))
+    return record
 
 
 def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
@@ -181,15 +238,18 @@ def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
         "vcpus": vm["vcpus"],
         "memory": vm["memory_mb"],
         "disk": vm["disk_gb"] * 1024,
+        "description": vm.get("description", ""),
         "local_context_data": {
             "vmctl": {
-                "version": 1,
+                "version": 2,
                 "source": vm["source"],
                 "iso": vm.get("iso"),
                 "image": vm.get("image"),
                 "user_data": vm.get("user_data"),
                 "bridge": bridge,
                 "storage_directory": storage_directory,
+                "interface_name": vm.get("interface_name", "inet"),
+                "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }
         },
     }
@@ -213,7 +273,7 @@ def patch_vm(config: dict, vm_id: int, changes: dict) -> dict:
     return _request(config, "PATCH", f"virtualization/virtual-machines/{vm_id}/", changes)
 
 
-def local_spec_from_netbox(record: dict) -> dict:
+def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
     try:
         memory = int(record["memory"])
         vcpus_value = Decimal(str(record["vcpus"]))
@@ -225,9 +285,9 @@ def local_spec_from_netbox(record: dict) -> dict:
         raise NetBoxError("NetBox VM lacks name, vCPUs, memory or disk") from error
     if disk_mb <= 0 or disk_mb % 1024 or memory <= 0 or vcpus <= 0 or vcpus_value != vcpus:
         raise NetBoxError("NetBox VM sizing must be positive and disk must be whole GiB")
-    if not isinstance(context, dict) or context.get("version") != 1:
+    if not isinstance(context, dict) or context.get("version") not in (1, 2):
         raise NetBoxError("NetBox VM has no supported vmctl context")
-    return {
+    result = {
         "name": name,
         "vcpus": vcpus,
         "memory_mb": memory,
@@ -239,3 +299,28 @@ def local_spec_from_netbox(record: dict) -> dict:
         "bridge": context.get("bridge"),
         "storage_directory": context.get("storage_directory"),
     }
+    if context["version"] == 2:
+        if config is None:
+            raise NetBoxError("NetBox VM inventory needs a NetBox connection")
+        interfaces = vm_interfaces(config, record["id"])
+        disks = vm_disks(config, record["id"])
+        name = context.get("interface_name", "inet")
+        if len(interfaces) != 1 or interfaces[0]["name"] != name:
+            raise NetBoxError(f"NetBox VM {record['name']} needs exactly one interface named {name!r}")
+        primary_mac = interfaces[0].get("primary_mac_address")
+        if not isinstance(primary_mac, dict) or not primary_mac.get("mac_address"):
+            raise NetBoxError(f"NetBox interface {name!r} needs a primary MAC address")
+        if len(disks) != 1 or disks[0]["name"] != record["name"] or int(disks[0]["size"]) != disk_mb:
+            raise NetBoxError(f"NetBox VM {record['name']} needs one matching virtual disk")
+        ip_ids = {item["id"] for item in interface_ips(config, interfaces[0]["id"])}
+        for family in (4, 6):
+            primary_ip = record.get(f"primary_ip{family}")
+            if primary_ip and primary_ip["id"] not in ip_ids:
+                raise NetBoxError(f"NetBox primary IPv{family} is not assigned to VM interface {name!r}")
+        result.update({
+            "description": record.get("description") or "",
+            "interface_name": name,
+            "mac_address": primary_mac["mac_address"],
+            "display": context.get("display"),
+        })
+    return result

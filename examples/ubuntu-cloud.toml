@@ -1,5 +1,6 @@
 [vm]
 name = "example-cloud"
+description = "Example Ubuntu cloud VM"
 source = "cloud_image"
 memory_mb = 2048
 vcpus = 2

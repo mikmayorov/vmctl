@@ -43,6 +43,31 @@ class CreationTests(unittest.TestCase):
         self.assertEqual([item.attrib["dev"] for item in root.findall("./os/boot")], ["hd"])
         self.assertEqual(root.find("./devices/disk[@device='cdrom']/source").attrib["file"], "/images/seed.iso")
 
+    def test_netbox_description_mac_and_display_reach_libvirt_xml(self):
+        vm = dict(self.vm, description="Service VM", uuid="00000000-0000-0000-0000-000000000001",
+                  mac_address="52:54:00:12:34:56",
+                  display={"type": "spice", "listen": "192.0.2.10", "port": 5930, "password": "example-secret"})
+        validate_spec({"vm": vm})
+        root = ET.fromstring(domain_xml(vm, Path("/images/test-vm.qcow2"), "br1"))
+        self.assertEqual(root.findtext("./description"), "Service VM")
+        self.assertEqual(root.findtext("./uuid"), vm["uuid"])
+        self.assertEqual(root.find("./devices/interface/mac").get("address"), "52:54:00:12:34:56")
+        self.assertEqual(root.find("./devices/graphics").attrib, {
+            "type": "spice", "listen": "192.0.2.10", "autoport": "no",
+            "port": "5930", "passwd": "example-secret",
+        })
+
+    def test_nonlocal_display_requires_password(self):
+        vm = dict(self.vm, display={"type": "vnc", "listen": "192.0.2.10", "port": 5901})
+        with self.assertRaisesRegex(ValueError, "password is required"):
+            validate_spec({"vm": vm})
+
+    def test_vnc_rejects_password_longer_than_libvirt_limit(self):
+        vm = dict(self.vm, display={"type": "vnc", "listen": "127.0.0.1", "port": 5999,
+                                    "password": "123456789"})
+        with self.assertRaisesRegex(ValueError, "at most 8"):
+            validate_spec({"vm": vm})
+
     def test_create_refuses_to_overwrite_existing_disk(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
@@ -54,8 +79,11 @@ class CreationTests(unittest.TestCase):
             config = {
                 "host": {"libvirt_uri": "qemu:///system"},
             }
-            with contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(ValueError, "already exist"):
+            with (
+                patch("vmcreate.subprocess.run", return_value=SimpleNamespace(stdout='{"format":"raw","virtual-size":1}')),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaisesRegex(ValueError, "existing disk differs"):
                     create_vm(vm, config, path, False)
 
     def test_sync_detects_local_drift(self):
@@ -158,11 +186,12 @@ class NetBoxTests(unittest.TestCase):
                 self.assertEqual(netbox.reserve_vm(config, vm, 7, 12)["id"], 42)
         self.assertEqual(request.call_args_list[1].args[3], {
             "name": "test-vm", "cluster": 7, "device": 12, "status": "planned", "start_on_boot": "off",
-            "vcpus": 2, "memory": 2048, "disk": 20480,
+            "vcpus": 2, "memory": 2048, "disk": 20480, "description": "",
             "local_context_data": {"vmctl": {
-                "version": 1, "source": "iso", "iso": "/images/installer.iso",
+                "version": 2, "source": "iso", "iso": "/images/installer.iso",
                 "image": None, "user_data": None, "bridge": "br1",
-                "storage_directory": "/images",
+                "storage_directory": "/images", "interface_name": "inet",
+                "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }},
         })
 
@@ -177,6 +206,51 @@ class NetBoxTests(unittest.TestCase):
         vm = netbox.local_spec_from_netbox(record)
         self.assertEqual((vm["vcpus"], vm["memory_mb"], vm["disk_gb"]), (4, 4096, 32))
         self.assertEqual(vm["iso"], "/images/install.iso")
+
+    def test_new_vm_reads_disk_mac_and_primary_ips_from_netbox(self):
+        record = {
+            "id": 42, "name": "test-vm", "vcpus": 2, "memory": 2048, "disk": 20480,
+            "description": "Service VM", "primary_ip4": {"id": 71}, "primary_ip6": {"id": 72},
+            "local_context_data": {"vmctl": {
+                "version": 2, "source": "iso", "iso": "/images/install.iso",
+                "bridge": "br1", "storage_directory": "/images", "interface_name": "inet",
+                "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
+            }},
+        }
+        with (
+            patch("netbox.vm_interfaces", return_value=[{"id": 8, "name": "inet", "primary_mac_address": {"mac_address": "52:54:00:12:34:56"}}]),
+            patch("netbox.vm_disks", return_value=[{"name": "test-vm", "size": 20480}]),
+            patch("netbox.interface_ips", return_value=[{"id": 71}, {"id": 72}]),
+        ):
+            vm = netbox.local_spec_from_netbox(record, {})
+        self.assertEqual(vm["mac_address"], "52:54:00:12:34:56")
+        self.assertEqual(vm["description"], "Service VM")
+
+    def test_components_are_created_before_local_vm(self):
+        record = {"id": 42, "name": "test-vm", "disk": 20480}
+        calls = []
+
+        def request(config, method, path, payload=None):
+            calls.append((method, path, payload))
+            if path == "virtualization/virtual-disks/":
+                return {"id": 3}
+            if path == "virtualization/interfaces/":
+                return {"id": 8, "name": "inet"}
+            if path == "dcim/mac-addresses/":
+                return {"id": 9}
+            return {}
+
+        with (
+            patch("netbox.vm_disks", return_value=[]),
+            patch("netbox.vm_interfaces", return_value=[]),
+            patch("netbox._request", side_effect=request),
+        ):
+            netbox.create_vm_components({}, record, mac="52:54:00:12:34:56")
+        self.assertEqual([item[1] for item in calls], [
+            "virtualization/virtual-disks/", "virtualization/interfaces/",
+            "dcim/mac-addresses/", "virtualization/interfaces/8/",
+        ])
+        self.assertEqual(calls[2][2]["assigned_object_type"], "virtualization.vminterface")
 
     def test_config_with_key_requires_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -325,13 +399,14 @@ class OperationOrderTests(unittest.TestCase):
                 patch("vmctl.find_device", return_value=(12, 7)),
                 patch("vmctl.reserve_vm", side_effect=lambda *a: order.append("netbox-create")),
                 patch("vmctl.get_vm", return_value={"id": 42, "status": {"value": "planned"}}),
+                patch("vmctl.create_vm_components", side_effect=lambda *a: order.append("netbox-components")),
                 patch("vmctl.local_spec_from_netbox", return_value=local_spec),
                 patch("vmctl.create_vm", side_effect=lambda *a: order.append("local-create")),
                 patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox-staged")),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(vmctl.main(), 0)
-            self.assertEqual(order, ["netbox-create", "local-create", "netbox-staged"])
+            self.assertEqual(order, ["netbox-create", "netbox-components", "local-create", "netbox-staged"])
 
     def test_start_updates_netbox_before_virsh(self):
         order = []
@@ -397,6 +472,30 @@ class OperationOrderTests(unittest.TestCase):
         create.assert_not_called()
         self.assertIn("Local VM definition matches NetBox", output.getvalue())
         self.assertIn("virsh -c qemu:///system start test-vm", output.getvalue())
+
+    def test_sync_applies_changed_netbox_definition_to_existing_vm(self):
+        args = Namespace(command="sync", vm="test-vm", config=Path("config.toml"), dry_run=False)
+        config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
+        record = {"id": 42, "name": "test-vm", "status": {"value": "staged"},
+                  "local_context_data": {"vmctl": {"version": 2, "source": "iso"}}}
+        plan = {"name": "test-vm", "source": "iso", "memory_mb": 2048,
+                "vcpus": 2, "disk_gb": 20, "iso": "/images/install.iso"}
+        with (
+            patch("vmctl.parse_args", return_value=args),
+            patch("vmctl.load_config", return_value=config),
+            patch("vmctl.find_device", return_value=(12, 7)),
+            patch("vmctl.get_vm", return_value=record),
+            patch("vmctl.local_spec_from_netbox", return_value=plan),
+            patch("vmctl.verify_local_vm", side_effect=[ValueError("drift"), None]) as verify,
+            patch("vmctl.redefine_vm") as redefine,
+            patch("vmctl.create_vm") as create,
+            patch("vmctl.subprocess.run", return_value=SimpleNamespace(stdout="test-vm\n")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(vmctl.main(), 0)
+        self.assertEqual(verify.call_count, 2)
+        redefine.assert_called_once()
+        create.assert_not_called()
 
     def test_start_does_not_run_virsh_when_netbox_fails(self):
         args = Namespace(command="start", vm="test-vm", config=Path("config.toml"), dry_run=False)

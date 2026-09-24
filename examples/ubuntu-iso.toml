@@ -1,5 +1,6 @@
 [vm]
 name = "example-ubuntu"
+description = "Example Ubuntu VM"
 source = "iso"
 memory_mb = 2048
 vcpus = 2

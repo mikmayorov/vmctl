@@ -16,7 +16,7 @@ def local_names(config: dict) -> list[str]:
 
 
 def inspect_vm(config: dict, name: str) -> dict:
-    root = ET.fromstring(_virsh(config, "dumpxml", name))
+    root = ET.fromstring(_virsh(config, "dumpxml", "--security-info", name))
     memory = root.find("./memory")
     vcpu = root.findtext("./vcpu")
     units = {"KiB": 1 / 1024, "MiB": 1, "GiB": 1024}
@@ -39,6 +39,16 @@ def inspect_vm(config: dict, name: str) -> dict:
             raise ValueError(f"VM {name}: cannot read capacity of {target.get('dev')}")
         disk_bytes += int(capacity)
     bridge = root.find("./devices/interface[@type='bridge']/source")
+    mac = root.find("./devices/interface[@type='bridge']/mac")
+    graphics = root.find("./devices/graphics")
+    display = None
+    if graphics is not None:
+        display = {
+            "type": graphics.get("type"), "listen": graphics.get("listen"),
+            "port": "auto" if graphics.get("autoport") == "yes" else int(graphics.get("port", "-1")),
+        }
+        if graphics.get("passwd"):
+            display["password"] = graphics.get("passwd")
     state = _virsh(config, "domstate", name)
     if state not in ("running", "shut off"):
         raise ValueError(f"VM {name}: unsupported power state {state!r}")
@@ -52,6 +62,9 @@ def inspect_vm(config: dict, name: str) -> dict:
         "disk_mb": (disk_bytes + 1024**2 - 1) // 1024**2,
         "disk_paths": disk_paths,
         "bridge": bridge.get("bridge") if bridge is not None else None,
+        "mac_address": mac.get("address") if mac is not None else None,
+        "description": root.findtext("./description") or "",
+        "display": display or {"type": "none"},
         "status": "active" if state == "running" else "offline",
         "autostart": autostart == "enable",
     }

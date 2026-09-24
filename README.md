@@ -51,6 +51,7 @@ ln -s /opt/vmctl/vmctl /usr/local/bin/vmctl
 | `vmctl autostart ИМЯ` / `vmctl autostart-off ИМЯ` | Включить / выключить запуск ВМ вместе с хостом. |
 | `vmctl console ИМЯ` | Подключиться к последовательной консоли ВМ. |
 | `vmctl vnc ИМЯ` | Показать VNC-дисплей ВМ. |
+| `vmctl prepare ФАЙЛ` | Создать ВМ, диск, интерфейс и MAC в NetBox без локальной ВМ. |
 | `vmctl sync ИМЯ` | Применить параметры и требуемое состояние ВМ из NetBox; требуется ключ. |
 | `vmctl audit` | Сравнить локальные ВМ с NetBox, вывести расхождения; требуется ключ. |
 | `vmctl adopt` | Создать в NetBox записи для локальных ВМ, которых там ещё нет; требуется ключ. Локальные ВМ не меняет. |
@@ -66,12 +67,17 @@ cd /opt/vmctl
 mkdir -p local
 cp examples/ubuntu-iso.toml local/guest.toml
 # Отредактируйте local/guest.toml
-vmctl --dry-run create local/guest.toml
-vmctl create local/guest.toml
+vmctl --dry-run prepare local/guest.toml
+vmctl prepare local/guest.toml
+# Заполните сеть и дисплей в NetBox, затем:
+vmctl --dry-run sync ИМЯ
+vmctl sync ИМЯ
 vmctl start ИМЯ
 ```
 
-`source = "iso"` создаёт пустой диск и подключает ISO. `source = "cloud_image"` копирует образ и добавляет cloud-init; для этого используйте `examples/ubuntu-cloud.toml` и замените пример SSH-ключа в `user_data`. Создание определяет ВМ, запуск выполняется отдельно.
+После `prepare` откройте ВМ в NetBox: на интерфейсе `inet` уже есть MAC, а у ВМ — виртуальный диск. Назначьте интерфейсу IPv4/IPv6 через IPAM и выберите их как Primary IPv4/IPv6 у ВМ. В `local_context_data.vmctl.display` задайте `type` (`vnc`, `spice` или `none`), `listen` (IP хоста), `port` (число от 5900 до 65535 либо `"auto"`) и при необходимости `password`. Для VNC пароль ограничен 8 байтами; при прослушивании не на localhost пароль обязателен. Description редактируется в обычном поле ВМ. `sync` переносит Description, MAC и дисплей в XML libvirt; изменение определения уже созданной ВМ требует её выключить. IP-адреса в NetBox документируют ВМ, но сами по себе не настраивают сеть внутри гостевой ОС.
+
+`source = "iso"` создаёт пустой диск и подключает ISO. `source = "cloud_image"` копирует образ и добавляет cloud-init; для этого используйте `examples/ubuntu-cloud.toml` и замените пример SSH-ключа в `user_data`. Для быстрого создания с настройками дисплея по умолчанию можно выполнить `vmctl create local/guest.toml`. Создание определяет ВМ, запуск выполняется отдельно.
 
 ### Учёт существующих ВМ в NetBox
 
