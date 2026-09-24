@@ -358,6 +358,11 @@ def main() -> int:
                         context = (record.get("local_context_data") or {}).get("vmctl") or {}
                         if context.get("version") != 2:
                             raise
+                        if not args.dry_run:
+                            patch_vm(config, record["id"], {
+                                "status": desired_status,
+                                "changelog_message": "vmctl requested local definition sync",
+                            })
                         redefine_vm(vm, config, Path(__file__).parent, args.dry_run)
                         changed = True
                         if not args.dry_run:

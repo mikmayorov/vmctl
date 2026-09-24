@@ -474,6 +474,7 @@ class OperationOrderTests(unittest.TestCase):
         self.assertIn("virsh -c qemu:///system start test-vm", output.getvalue())
 
     def test_sync_applies_changed_netbox_definition_to_existing_vm(self):
+        order = []
         args = Namespace(command="sync", vm="test-vm", config=Path("config.toml"), dry_run=False)
         config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
         record = {"id": 42, "name": "test-vm", "status": {"value": "staged"},
@@ -487,13 +488,15 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.get_vm", return_value=record),
             patch("vmctl.local_spec_from_netbox", return_value=plan),
             patch("vmctl.verify_local_vm", side_effect=[ValueError("drift"), None]) as verify,
-            patch("vmctl.redefine_vm") as redefine,
+            patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox")),
+            patch("vmctl.redefine_vm", side_effect=lambda *a: order.append("libvirt")) as redefine,
             patch("vmctl.create_vm") as create,
             patch("vmctl.subprocess.run", return_value=SimpleNamespace(stdout="test-vm\n")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(vmctl.main(), 0)
         self.assertEqual(verify.call_count, 2)
+        self.assertEqual(order, ["netbox", "libvirt"])
         redefine.assert_called_once()
         create.assert_not_called()
 
