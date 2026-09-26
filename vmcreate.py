@@ -31,6 +31,13 @@ def interface_alias(name: str) -> str:
     return "ua-vmctl-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
 
 
+def host_interface_name(vm_name: str, interface_name: str) -> str:
+    """Stable Linux tap name (at most 15 bytes) that identifies its VM."""
+    label = re.sub(r"[^a-z0-9]", "-", vm_name.lower())[:5]
+    digest = hashlib.blake2s(f"{vm_name}\0{interface_name}".encode(), digest_size=3).hexdigest()
+    return f"vm-{label}-{digest}"
+
+
 def pending_purge_file(project_dir: Path, name: str) -> Path:
     return project_dir / "state" / "pending-purge" / f"{name}.json"
 
@@ -69,11 +76,12 @@ def _disk_element(devices: ET.Element, path: str, target: str) -> ET.Element:
     return node
 
 
-def _interface_element(devices: ET.Element, item: dict) -> ET.Element:
+def _interface_element(devices: ET.Element, item: dict, vm_name: str) -> ET.Element:
     node = ET.SubElement(devices, "interface", {"type": "bridge"})
     if item.get("mac_address"):
         ET.SubElement(node, "mac", {"address": item["mac_address"].lower()})
     ET.SubElement(node, "source", {"bridge": item["bridge"]})
+    ET.SubElement(node, "target", {"dev": host_interface_name(vm_name, item["name"])})
     ET.SubElement(node, "model", {"type": "virtio"})
     ET.SubElement(node, "alias", {"name": item.get("alias") or interface_alias(item["name"])})
     return node
@@ -158,7 +166,7 @@ def domain_xml(vm: dict, disk: Path, bridge: str, seed: Path | None = None) -> s
     ET.SubElement(cdrom, "target", {"dev": "sda", "bus": "sata"})
     ET.SubElement(cdrom, "readonly")
     for item in vm_interfaces(vm, bridge):
-        _interface_element(devices, item)
+        _interface_element(devices, item, vm["name"])
     ET.SubElement(devices, "serial", {"type": "pty"})
     ET.SubElement(devices, "console", {"type": "pty"})
     display = vm.get("display", {"type": "vnc", "listen": "127.0.0.1", "port": "auto"})
@@ -334,7 +342,7 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
         source.set("bridge", item["bridge"])
     for key, item in wanted.items():
         if key not in used:
-            _interface_element(devices, item)
+            _interface_element(devices, item, vm["name"])
     root.find("./memory").text = str(vm["memory_mb"])
     root.find("./memory").set("unit", "MiB")
     root.find("./vcpu").text = str(vm["vcpus"])

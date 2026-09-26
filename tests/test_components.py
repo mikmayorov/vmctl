@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import netbox
 import vmctl
-from vmcreate import domain_xml, redefine_vm
+from vmcreate import domain_xml, host_interface_name, redefine_vm
 
 
 class ComponentTests(unittest.TestCase):
@@ -46,6 +46,16 @@ class ComponentTests(unittest.TestCase):
                          ["/images/guest.qcow2", "/images/guest-data.qcow2"])
         self.assertEqual([node.get("bridge") for node in root.findall("./devices/interface/source")],
                          ["br0", "br2"])
+        self.assertEqual([node.get("dev") for node in root.findall("./devices/interface/target")],
+                         [host_interface_name("guest", "inet"), host_interface_name("guest", "backup")])
+
+    def test_host_tap_names_are_stable_distinct_and_fit_linux_limit(self):
+        first = host_interface_name("very-long-virtual-machine-name", "inet")
+        second = host_interface_name("very-long-virtual-machine-name", "backup")
+        self.assertEqual(first, host_interface_name("very-long-virtual-machine-name", "inet"))
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(first.encode()), 15)
+        self.assertTrue(first.startswith("vm-very-"))
 
     def test_redefine_preserves_uuid_and_adds_disk_without_changing_existing_disk(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
             "vm", nargs="?", metavar="ИМЯ", help="Имя локальной ВМ; без имени проверяется хост")
     add("audit", "Сверить все локальные ВМ с NetBox; вывести расхождения, ничего не меняя. Нужен API-ключ.",
         "vmctl audit")
-    add("list", "Показать таблицу локальных ВМ: состояние, ресурсы, автозапуск, IP из NetBox и дисплей.", "vmctl list")
+    add("list", "Показать таблицу локальных ВМ: состояние, ресурсы, автозапуск, IP из NetBox и URL дисплея.", "vmctl list")
 
     prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
                   "vmctl prepare local/guest.toml",
@@ -255,6 +255,20 @@ def verify_vm_serial(config: dict, record: dict, local_exists: bool) -> str:
     return saved
 
 
+def display_url(display: dict) -> str:
+    kind = (display.get("type") or "none").lower()
+    if kind == "none":
+        return "-"
+    listen = display.get("listen")
+    port = display.get("port")
+    if not listen:
+        return kind.upper()
+    host = f"[{listen}]" if ":" in listen and not listen.startswith("[") else listen
+    if isinstance(port, int) and port >= 0:
+        return f"{kind}://{host}:{port}"
+    return f"{kind.upper()} {host} (порт при запуске)"
+
+
 def show_list(config: dict) -> int:
     """Show local domains with NetBox primary addresses when available."""
     names = local_names(config)
@@ -269,12 +283,13 @@ def show_list(config: dict) -> int:
         except NetBoxError as error:
             print(f"NetBox недоступен; IP-адреса не показаны: {error}", file=sys.stderr)
 
-    headings = ("Имя", "Состояние", "CPU", "RAM MiB", "Диск GiB", "Авто", "IPv4", "IPv6", "Дисплей")
+    headings = ("Имя", "Состояние", "CPU", "RAM MiB", "Диск GiB", "Авто", "IPv4", "IPv6", "Дисплей / URL")
     rows = []
     failed = False
     for name in names:
         try:
             vm = inspect_vm(config, name)
+            display = inspect_display(config, name)
             disk_gib = vm["disk_mb"] / 1024
             disk_text = f"{disk_gib:.1f}".rstrip("0").rstrip(".") if disk_gib else "0"
             record = records.get(name, {})
@@ -285,7 +300,7 @@ def show_list(config: dict) -> int:
             rows.append((name, "запущена" if vm["status"] == "active" else "выключена",
                          str(vm["vcpus"]), str(vm["memory_mb"]), disk_text,
                          "да" if vm["autostart"] else "нет", primary_ip("4"), primary_ip("6"),
-                         (vm["display"].get("type") or "none").upper()))
+                         display_url(display)))
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             failed = True
             print(f"{name}: не удалось прочитать параметры: {error}", file=sys.stderr)
@@ -735,7 +750,7 @@ def check_vm(config: dict, name: str) -> int:
     print(f"Интерфейсы: {len(vm['interfaces'])}")
     for interface in vm["interfaces"]:
         print(f"  {interface['name']}: MAC {interface['mac_address'] or '-'}; "
-              f"мост {interface['bridge'] or '-'}")
+              f"мост {interface['bridge'] or '-'}; host {interface.get('host_dev') or '-'}")
     print(f"Дисплей: {(display.get('type') or 'none').upper()}")
     if display.get("type") != "none":
         print(f"  IP: {display.get('listen') or '-'}")

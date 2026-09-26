@@ -85,10 +85,11 @@ def inspect_vm(config: dict, name: str) -> dict:
                                      if node.get("type") != "bridge"})
     nic_items = []
     for index, node in enumerate(root.findall("./devices/interface[@type='bridge']")):
-        source, mac, alias = node.find("source"), node.find("mac"), node.find("alias")
+        source, mac, alias, target = node.find("source"), node.find("mac"), node.find("alias"), node.find("target")
         nic_items.append({"name": "inet" if index == 0 else f"net-{index + 1}",
                           "bridge": source.get("bridge") if source is not None else None,
                           "mac_address": mac.get("address") if mac is not None else None,
+                          "host_dev": target.get("dev") if target is not None else None,
                           "alias": alias.get("name") if alias is not None else None})
     bridge = root.find("./devices/interface[@type='bridge']/source")
     mac = root.find("./devices/interface[@type='bridge']/mac")
