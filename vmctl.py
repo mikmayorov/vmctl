@@ -121,14 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
         "vmctl audit")
     add("list", "Показать таблицу локальных ВМ: состояние, ресурсы, автозапуск, IP из NetBox и дисплей.", "vmctl list")
 
-    prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Нужен API-ключ; libvirt не меняется.",
+    prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
                   "vmctl prepare local/guest.toml",
-                  details="После подготовки назначьте IP и дисплей в NetBox, затем выполните vmctl sync ИМЯ.")
+                  details="После prepare можно назначить IP в NetBox IPAM, настроить дисплей и изменить параметры ВМ. Затем выполните vmctl sync ИМЯ.")
     prepare.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
-    create = add("create", "Создать ВМ из ISO или cloud image: сначала запись в NetBox, затем локальную ВМ. Без ключа работает только локально; ВМ не запускает.",
-                 "vmctl create local/guest.toml")
+    create = add("create", "При наличии ключа выполнить prepare и первый sync за один вызов: сначала запись и компоненты в NetBox, затем локальная ВМ из этой записи. Между этапами нет паузы для правок в NetBox. Без ключа создаёт ВМ только локально; ВМ не запускает.",
+                 "vmctl create local/guest.toml",
+                 details="Если нужно назначить IP или изменить дисплей до создания локальной ВМ, используйте prepare, затем правки в NetBox и sync.")
     create.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
-    sync = add("sync", "Применить требуемое состояние ВМ из NetBox к libvirt. Нужен API-ключ; для изменения XML выключите ВМ.",
+    sync = add("sync", "Создать отсутствующую или обновить локальную ВМ по записи NetBox. Нужен API-ключ; для изменения XML выключите ВМ.",
                "vmctl --dry-run sync guest",
                details="Сначала проверьте план через vmctl --dry-run sync ИМЯ. IP в гостевой ОС команда не настраивает.")
     sync.add_argument("vm", metavar="ИМЯ", help="Имя ВМ на устройстве этого хоста в NetBox")
@@ -195,9 +196,9 @@ def build_parser() -> argparse.ArgumentParser:
             ("audit", "Сверить ВМ с NetBox"),
         ]),
         ("Виртуальные машины", [
-            ("prepare", "Создать запись и компоненты в NetBox"),
-            ("create", "Создать запись в NetBox и локальную ВМ"),
-            ("sync", "Применить NetBox; --purge удалит файлы дисков"),
+            ("prepare", "Только NetBox; затем правки и sync"),
+            ("create", "prepare + sync сразу, без паузы для правок"),
+            ("sync", "Создать/обновить ВМ по NetBox; --purge: файлы"),
             ("adopt", "Завести в NetBox отсутствующие локальные ВМ"),
             ("delete", "Удалить ВМ; --purge удалит и диски"),
         ]),
