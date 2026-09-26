@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import netbox
 import vmctl
-from vmcreate import domain_xml, host_interface_name, redefine_vm
+from vmcreate import domain_xml, host_interface_name, redefine_vm, verify_local_vm
 
 
 class ComponentTests(unittest.TestCase):
@@ -72,6 +72,9 @@ class ComponentTests(unittest.TestCase):
             original["disks"] = spec["disks"][:1]
             original["uuid"] = "00112233-4455-6677-8899-aabbccddeeff"
             xml = domain_xml(original, root_disk, "br0")
+            old_root = ET.fromstring(xml)
+            old_root.find("./devices/interface/target").set("dev", "vnet11")
+            xml = ET.tostring(old_root, encoding="unicode")
             calls = []
 
             def run(command, **kwargs):
@@ -85,9 +88,14 @@ class ComponentTests(unittest.TestCase):
                 return SimpleNamespace(stdout="")
 
             with patch("vmcreate.subprocess.run", side_effect=run):
+                with self.assertRaisesRegex(ValueError, "differs from its NetBox definition"):
+                    verify_local_vm(original, {"host": {"libvirt_uri": "qemu:///system"}})
                 redefine_vm(spec, {"host": {"libvirt_uri": "qemu:///system"},
                                    "storage": {"directory": directory}, "network": {"bridge": "br0"}},
                             storage, False)
+            result = ET.fromstring((storage / "state/domains/guest.xml").read_text())
+            self.assertEqual(result.find("./devices/interface/target").get("dev"),
+                             host_interface_name("guest", "inet"))
             result = ET.fromstring((storage / "state/domains/guest.xml").read_text())
             self.assertEqual(result.findtext("./uuid"), original["uuid"])
             self.assertEqual(len(result.findall("./devices/disk[@device='disk']")), 2)

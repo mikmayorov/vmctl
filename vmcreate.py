@@ -210,6 +210,8 @@ def verify_local_vm(vm: dict, config: dict) -> None:
         wanted = wanted_interfaces[0]
         interface_match = (local.find("source") is not None
                            and local.find("source").get("bridge") == wanted["bridge"]
+                           and local.find("target") is not None
+                           and local.find("target").get("dev") == host_interface_name(vm["name"], wanted["name"])
                            and (not wanted.get("mac_address") or
                                 local.find("mac") is not None and local.find("mac").get("address", "").lower() == wanted["mac_address"].lower()))
     else:
@@ -219,6 +221,8 @@ def verify_local_vm(vm: dict, config: dict) -> None:
             local = actual_by_alias.get(wanted.get("alias") or interface_alias(wanted["name"]))
             if local is None or local.find("source") is None or local.find("mac") is None or \
                     local.find("source").get("bridge") != wanted["bridge"] or \
+                    local.find("target") is None or \
+                    local.find("target").get("dev") != host_interface_name(vm["name"], wanted["name"]) or \
                     local.find("mac").get("address", "").lower() != wanted["mac_address"].lower():
                 interface_match = False
     graphics = root.find("./devices/graphics")
@@ -340,6 +344,10 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
         if source is None:
             source = ET.SubElement(node, "source")
         source.set("bridge", item["bridge"])
+        target = node.find("target")
+        if target is None:
+            target = ET.SubElement(node, "target")
+        target.set("dev", host_interface_name(vm["name"], item["name"]))
     for key, item in wanted.items():
         if key not in used:
             _interface_element(devices, item, vm["name"])
