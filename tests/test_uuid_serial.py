@@ -1,13 +1,11 @@
 import io
 import unittest
-from argparse import Namespace
 from contextlib import redirect_stdout
-from pathlib import Path
 from unittest.mock import patch
 
 import netbox
 import vmctl
-from vmctl import sync_vm_serial
+from vmctl import verify_vm_serial
 
 
 CONFIG = {"host": {"libvirt_uri": "qemu:///system"}}
@@ -15,21 +13,6 @@ UUID = "00000000-0000-4000-8000-000000000123"
 
 
 class UUIDSerialTests(unittest.TestCase):
-    def test_serial_only_sync_works_for_legacy_record_without_vmctl_context(self):
-        args = Namespace(command="sync", vm="guest", serial_only=True, purge=False,
-                         config=Path("config.toml"), dry_run=False)
-        record = {"id": 42, "name": "guest", "serial": ""}
-        with patch("vmctl.parse_args", return_value=args), \
-             patch("vmctl.load_config", return_value={**CONFIG, "netbox": {"key": "test"}}), \
-             patch("vmctl.find_device", return_value=(12, 7)), \
-             patch("vmctl.get_vm", return_value=record), \
-             patch("vmctl.local_names", return_value=["guest"]), \
-             patch("vmctl.sync_vm_serial") as serial_sync, \
-             patch("vmctl.local_spec_from_netbox") as vm_spec:
-            self.assertEqual(vmctl.main(), 0)
-        serial_sync.assert_called_once()
-        vm_spec.assert_not_called()
-
     def test_adopted_vm_posts_local_uuid_to_netbox_serial(self):
         vm = {
             "name": "guest", "uuid": UUID, "status": "active", "vcpus": 2,
@@ -44,25 +27,26 @@ class UUIDSerialTests(unittest.TestCase):
             netbox.import_vm(CONFIG, vm, 7, 12)
         self.assertEqual(request.call_args.args[3]["serial"], UUID)
 
-    def test_backfill_writes_netbox_before_continuing(self):
+    def test_missing_serial_blocks_sync_without_netbox_write(self):
         record = {"id": 42, "name": "guest", "serial": ""}
-        updated = {**record, "serial": UUID}
-        order = []
-        with patch("vmctl.local_uuid", return_value=UUID), \
-             patch("vmctl.patch_vm", side_effect=lambda *args: order.append("patch")), \
-             patch("vmctl.find_device", return_value=(12, 7)), \
-             patch("vmctl.get_vm", side_effect=lambda *args: (order.append("read") or updated)), \
-             redirect_stdout(io.StringIO()):
-            result = sync_vm_serial(CONFIG, record, True, False, True)
-        self.assertEqual(result["serial"], UUID)
-        self.assertEqual(order, ["patch", "read"])
+        with patch("vmctl.local_uuid") as local, patch("vmctl.patch_vm") as update:
+            with self.assertRaisesRegex(netbox.NetBoxError, "Serial is empty"):
+                verify_vm_serial(CONFIG, record, True)
+        local.assert_not_called()
+        update.assert_not_called()
+
+    def test_matching_serial_is_read_only(self):
+        record = {"id": 42, "name": "guest", "serial": UUID}
+        with patch("vmctl.local_uuid", return_value=UUID), patch("vmctl.patch_vm") as update:
+            self.assertEqual(verify_vm_serial(CONFIG, record, True), UUID)
+        update.assert_not_called()
 
     def test_conflicting_serial_blocks_update(self):
         record = {"id": 42, "name": "guest", "serial": UUID}
         with patch("vmctl.local_uuid", return_value="00000000-0000-4000-8000-000000000456"), \
              patch("vmctl.patch_vm") as update:
             with self.assertRaisesRegex(netbox.NetBoxError, "differs"):
-                sync_vm_serial(CONFIG, record, True, False)
+                verify_vm_serial(CONFIG, record, True)
         update.assert_not_called()
 
 
