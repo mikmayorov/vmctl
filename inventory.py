@@ -15,6 +15,22 @@ def local_names(config: dict) -> list[str]:
     return sorted(set(_virsh(config, "list", "--all", "--name").splitlines()))
 
 
+def inspect_display(config: dict, name: str) -> dict:
+    """Return effective graphics settings, including the live auto-assigned port."""
+    root = ET.fromstring(_virsh(config, "dumpxml", "--security-info", name))
+    graphics = root.find("./devices/graphics")
+    if graphics is None:
+        return {"type": "none"}
+    listener = graphics.find("./listen[@type='address']")
+    listen = graphics.get("listen") or (listener.get("address") if listener is not None else None)
+    port_text = graphics.get("port")
+    port = int(port_text) if port_text and int(port_text) >= 0 else "auto"
+    result = {"type": graphics.get("type"), "listen": listen, "port": port}
+    if graphics.get("passwd"):
+        result["password"] = graphics.get("passwd")
+    return result
+
+
 def inspect_vm(config: dict, name: str) -> dict:
     root = ET.fromstring(_virsh(config, "dumpxml", "--security-info", name))
     memory = root.find("./memory")

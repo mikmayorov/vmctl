@@ -18,7 +18,7 @@ from netbox import (
     find_device, find_vm, get_vm, has_netbox_key, import_vm, interface_ips, interface_macs, list_vms,
     local_spec_from_netbox, patch_vm, remove_component, reserve_vm, vm_disks, vm_interfaces,
 )
-from inventory import inspect_vm, local_names
+from inventory import inspect_display, inspect_vm, local_names
 from vmcreate import (NAME_RE, create_vm, interface_alias, pending_purge_file, purge_pending,
                       redefine_vm, validate_spec, verify_local_vm)
 
@@ -122,16 +122,9 @@ def build_parser() -> argparse.ArgumentParser:
         "vmctl doctor")
     add("audit", "Сверить все локальные ВМ с NetBox; вывести расхождения, ничего не меняя. Нужен API-ключ.",
         "vmctl audit")
-    add("check", "Показать версию локального libvirt.", "vmctl check")
-    add("list", "Показать все локальные ВМ и их состояния.", "vmctl list")
-    add("pools", "Показать пулы хранения libvirt.", "vmctl pools")
-    add("networks", "Показать сети libvirt.", "vmctl networks")
-    for name, description in (
-        ("info", "Показать параметры локальной ВМ из libvirt."),
-        ("status", "Показать текущее состояние локальной ВМ."),
-    ):
-        add(name, description, f"vmctl {name} guest").add_argument("vm", metavar="ИМЯ",
-                                                                   help="Имя локальной ВМ")
+    add("list", "Показать таблицу локальных ВМ: состояние, ресурсы, автозапуск, IP из NetBox и дисплей.", "vmctl list")
+    add("info", "Показать подробные параметры локальной ВМ из libvirt.", "vmctl info guest").add_argument(
+        "vm", metavar="ИМЯ", help="Имя локальной ВМ")
 
     prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Нужен API-ключ; libvirt не меняется.",
                   "vmctl prepare local/guest.toml",
@@ -196,18 +189,18 @@ def build_parser() -> argparse.ArgumentParser:
         ("reboot", "Запросить штатную перезагрузку работающей ВМ."),
         ("autostart", "Включить автоматический запуск ВМ вместе с хостом."),
         ("autostart-off", "Выключить автоматический запуск ВМ вместе с хостом."),
-        ("console", "Открыть последовательную консоль ВМ в текущем терминале."),
-        ("vnc", "Показать обозначение VNC-дисплея ВМ из libvirt."),
+        ("console", "Подключиться к serial-порту ВМ; для приглашения входа гостевая ОС должна обслуживать этот порт. Выход: Ctrl+]."),
+        ("display", "Показать фактические тип, IP, порт и пароль графического дисплея ВМ из libvirt."),
     ):
         add(name, description, f"vmctl {name} guest").add_argument("vm", metavar="ИМЯ",
                                                                    help="Имя локальной ВМ")
 
     parser.epilog = _overview([
-        ("Проверка и просмотр", ["doctor", "audit", "check", "list", "info", "status", "pools", "networks"]),
+        ("Проверка и просмотр", ["doctor", "audit", "list", "info"]),
         ("Создание и учёт в NetBox", ["prepare", "create", "sync", "adopt"]),
         ("Диски, интерфейсы и удаление", ["disk add", "disk remove", "nic add", "nic remove", "delete"]),
         ("Питание и автозапуск", ["start", "shutdown", "reboot", "autostart", "autostart-off"]),
-        ("Доступ к ВМ", ["console", "vnc"]),
+        ("Доступ к ВМ", ["console", "display"]),
     ], parsers)
     return parser
 
@@ -219,6 +212,70 @@ def parse_args() -> argparse.Namespace:
 def require_netbox(config: dict) -> None:
     if not has_netbox_key(config):
         raise NetBoxError("NetBox key is absent; this host runs in local-only mode")
+
+
+def show_display(config: dict, name: str) -> int:
+    display = inspect_display(config, name)
+    kind = display["type"]
+    print(f"ВМ: {name}")
+    print("Источник: локальный XML libvirt")
+    print(f"Тип: {kind.upper() if kind else 'неизвестен'}")
+    if kind == "none":
+        print("Графический дисплей не настроен")
+        return 0
+    listen = display.get("listen")
+    port = display.get("port")
+    print(f"IP: {listen or 'не указан'}")
+    print(f"Порт: {port if isinstance(port, int) else 'назначится при запуске ВМ'}")
+    password = display.get("password")
+    print(f"Пароль: {json.dumps(password, ensure_ascii=False) if password is not None else 'не задан'}")
+    if listen in ("127.0.0.1", "::1"):
+        print("Подключение с другого компьютера: через SSH-туннель")
+    elif listen in ("0.0.0.0", "::"):
+        print("Для подключения укажите конкретный IP этого хоста")
+    return 0
+
+
+def show_list(config: dict) -> int:
+    """Show local domains with NetBox primary addresses when available."""
+    names = local_names(config)
+    if not names:
+        print("Локальных ВМ нет.")
+        return 0
+    records = {}
+    if has_netbox_key(config):
+        try:
+            device_id, _ = find_device(config)
+            records = {vm["name"]: vm for vm in list_vms(config, device_id)}
+        except NetBoxError as error:
+            print(f"NetBox недоступен; IP-адреса не показаны: {error}", file=sys.stderr)
+
+    headings = ("Имя", "Состояние", "CPU", "RAM MiB", "Диск GiB", "Авто", "IPv4", "IPv6", "Дисплей")
+    rows = []
+    failed = False
+    for name in names:
+        try:
+            vm = inspect_vm(config, name)
+            disk_gib = vm["disk_mb"] / 1024
+            disk_text = f"{disk_gib:.1f}".rstrip("0").rstrip(".") if disk_gib else "0"
+            record = records.get(name, {})
+
+            def primary_ip(family: str) -> str:
+                ip = record.get(f"primary_ip{family}")
+                return ip.get("address", "-") if isinstance(ip, dict) else "-"
+            rows.append((name, "запущена" if vm["status"] == "active" else "выключена",
+                         str(vm["vcpus"]), str(vm["memory_mb"]), disk_text,
+                         "да" if vm["autostart"] else "нет", primary_ip("4"), primary_ip("6"),
+                         (vm["display"].get("type") or "none").upper()))
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            failed = True
+            print(f"{name}: не удалось прочитать параметры: {error}", file=sys.stderr)
+            rows.append((name, "ошибка", "-", "-", "-", "-", "-", "-", "-"))
+
+    widths = [max(len(str(row[index])) for row in (headings, *rows)) for index in range(len(headings))]
+    for row in (headings, *rows):
+        print("  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)).rstrip())
+    return 1 if failed else 0
 
 
 def _stopped(config: dict, name: str) -> bool:
@@ -642,6 +699,20 @@ def main() -> int:
             print(f"{args.command} failed: {error}", file=sys.stderr)
             return 1
 
+    if args.command == "display":
+        try:
+            return show_display(config, args.vm)
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            print(f"display failed: {error}", file=sys.stderr)
+            return 1
+
+    if args.command == "list":
+        try:
+            return show_list(config)
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            print(f"list failed: {error}", file=sys.stderr)
+            return 1
+
     if args.command in ("create", "prepare", "sync"):
         reserved_name = None
         try:
@@ -789,17 +860,11 @@ def main() -> int:
         return 0
 
     virsh_args = {
-        "check": ["version"],
-        "list": ["list", "--all"],
-        "pools": ["pool-list", "--all"],
-        "networks": ["net-list", "--all"],
         "info": ["dominfo", getattr(args, "vm", "")],
-        "status": ["domstate", getattr(args, "vm", "")],
         "start": ["start", getattr(args, "vm", "")],
         "shutdown": ["shutdown", getattr(args, "vm", "")],
         "reboot": ["reboot", getattr(args, "vm", "")],
         "console": ["console", getattr(args, "vm", "")],
-        "vnc": ["vncdisplay", getattr(args, "vm", "")],
         "autostart": ["autostart", getattr(args, "vm", "")],
         "autostart-off": ["autostart", "--disable", getattr(args, "vm", "")],
     }[args.command]
@@ -816,6 +881,10 @@ def main() -> int:
             print(f"NetBox: update {args.vm}: {netbox_changes}")
         print(shlex.join(command))
         return 0
+    if args.command == "console":
+        print(f"Открываю serial-консоль {args.vm} (не графический экран). Если после Enter пусто, "
+              f"настройте serial-вход внутри гостя; графический дисплей: vmctl display {args.vm}. "
+              "Выход: Ctrl+].", file=sys.stderr, flush=True)
     if netbox_changes and has_netbox_key(config):
         try:
             device_id, cluster_id = find_device(config)
