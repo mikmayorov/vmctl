@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -181,13 +182,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, description in (
         ("start", "Запросить запуск ВМ; при наличии ключа сначала установить статус active в NetBox."),
-        ("shutdown", "Запросить штатное выключение ВМ; при наличии ключа сначала установить статус offline в NetBox. Дождитесь остановки гостя."),
+        ("shutdown", "Запросить штатное выключение и ждать до 60 секунд. Если гость не ответил, вернуть ошибку. При наличии ключа сначала установить offline в NetBox."),
         ("reboot", "Запросить штатную перезагрузку работающей ВМ."),
         ("autostart", "Включить автоматический запуск ВМ вместе с хостом."),
         ("autostart-off", "Выключить автоматический запуск ВМ вместе с хостом."),
     ):
         add(name, description, f"vmctl {name} guest").add_argument("vm", metavar="ИМЯ",
                                                                    help="Имя локальной ВМ")
+    parsers["shutdown"].add_argument("--force", action="store_true",
+                                     help="Немедленно выключить через virsh destroy; возможна потеря незаписанных данных")
 
     parser.epilog = _overview([
         ("Просмотр", [
@@ -210,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
         ]),
         ("Питание", [
             ("start", "Запустить"),
-            ("shutdown", "Штатно выключить"),
+            ("shutdown", "Выключить; --force: без ожидания гостя"),
             ("reboot", "Перезагрузить"),
             ("autostart", "Включить автозапуск"),
             ("autostart-off", "Выключить автозапуск"),
@@ -727,6 +730,52 @@ def reconcile_power(config: dict, record: dict, desired_status: str) -> None:
         subprocess.run(["virsh", "-c", uri, command, name], check=True)
 
 
+def shutdown_vm(config: dict, name: str, force: bool, dry_run: bool) -> int:
+    uri = config["host"]["libvirt_uri"]
+    command = ["virsh", "-c", uri, "destroy" if force else "shutdown", name]
+    if dry_run:
+        if has_netbox_key(config):
+            print(f"NetBox: update {name}: {{'status': 'offline'}}")
+        print(shlex.join(command))
+        return 0
+
+    if has_netbox_key(config):
+        device_id, cluster_id = find_device(config)
+        record = get_vm(config, name, cluster_id, device_id)
+        patch_vm(config, record["id"], {
+            "status": "offline",
+            "changelog_message": "vmctl requested forced shutdown" if force else "vmctl requested shutdown",
+        })
+
+    def state() -> str:
+        return subprocess.run(["virsh", "-c", uri, "domstate", name], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    if state() == "shut off":
+        print(f"VM {name} is already shut off")
+        return 0
+    subprocess.run(command, check=True)
+    if force:
+        if state() != "shut off":
+            print(f"VM {name} is still running after forced shutdown", file=sys.stderr)
+            return 1
+        print(f"VM {name} is shut off")
+        return 0
+
+    deadline = time.monotonic() + 60
+    while True:
+        current = state()
+        if current == "shut off":
+            print(f"VM {name} is shut off")
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"VM {name} did not shut down within 60 seconds (state: {current}). "
+                  f"Check the guest or use vmctl shutdown {name} --force for a hard power-off.", file=sys.stderr)
+            return 1
+        time.sleep(min(2, remaining))
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -760,6 +809,15 @@ def main() -> int:
             return show_list(config)
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"list failed: {error}", file=sys.stderr)
+            return 1
+
+    if args.command == "shutdown":
+        try:
+            return shutdown_vm(config, args.vm, args.force, args.dry_run)
+        except (NetBoxError, OSError, subprocess.CalledProcessError) as error:
+            print(f"shutdown failed: {error}", file=sys.stderr)
+            if has_netbox_key(config):
+                print("NetBox remains the source of truth; check vmctl audit and retry.", file=sys.stderr)
             return 1
 
     if args.command in ("create", "prepare", "sync"):
@@ -910,7 +968,6 @@ def main() -> int:
 
     virsh_args = {
         "start": ["start", getattr(args, "vm", "")],
-        "shutdown": ["shutdown", getattr(args, "vm", "")],
         "reboot": ["reboot", getattr(args, "vm", "")],
         "autostart": ["autostart", getattr(args, "vm", "")],
         "autostart-off": ["autostart", "--disable", getattr(args, "vm", "")],
@@ -918,7 +975,6 @@ def main() -> int:
     command = ["virsh", "-c", config["host"]["libvirt_uri"], *virsh_args]
     netbox_changes = {
         "start": {"status": "active"},
-        "shutdown": {"status": "offline"},
         "reboot": {"status": "active"},
         "autostart": {"start_on_boot": "on"},
         "autostart-off": {"start_on_boot": "off"},
