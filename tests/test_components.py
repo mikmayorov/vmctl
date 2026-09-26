@@ -57,6 +57,26 @@ class ComponentTests(unittest.TestCase):
         self.assertLessEqual(len(first.encode()), 15)
         self.assertTrue(first.startswith("vm-very-"))
 
+    def test_dry_run_plans_tap_name_change_for_running_vm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            disk = Path(directory) / "guest.qcow2"
+            disk.touch()
+            spec = {"name": "guest", "source": "existing", "memory_mb": 2048, "vcpus": 2,
+                    "bridge": "br0", "storage_directory": directory,
+                    "disks": [{"name": "guest", "path": str(disk), "size_gb": 20}],
+                    "interfaces": [{"name": "inet", "bridge": "br0", "mac_address": "52:54:00:00:00:01"}]}
+            xml = domain_xml(spec, disk, "br0")
+
+            def run(command, **kwargs):
+                return SimpleNamespace(stdout="running\n" if "domstate" in command else xml)
+
+            with (patch("vmcreate.subprocess.run", side_effect=run) as command,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                redefine_vm(spec, {"host": {"libvirt_uri": "qemu:///system"},
+                                   "storage": {"directory": directory}}, Path(directory), True)
+            self.assertIn("REQUIRES SHUTDOWN: guest is running", output.getvalue())
+            self.assertFalse(any("define" in item.args[0] for item in command.call_args_list))
+
     def test_redefine_preserves_uuid_and_adds_disk_without_changing_existing_disk(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = Path(directory)

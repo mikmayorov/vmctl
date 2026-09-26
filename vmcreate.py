@@ -255,7 +255,7 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
     name = vm["name"]
     state = subprocess.run(["virsh", "-c", uri, "domstate", name],
                            check=True, capture_output=True, text=True).stdout.strip()
-    if state != "shut off":
+    if state != "shut off" and not dry_run:
         raise ValueError(f"shut down {name} before changing its libvirt definition")
     xml_path = project_dir / "state" / "domains" / f"{name}.xml"
     current = subprocess.run(["virsh", "-c", uri, "dumpxml", "--inactive", "--security-info", name],
@@ -373,6 +373,8 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
         ET.SubElement(devices, "graphics", attributes)
     if dry_run:
         print(f"WOULD UPDATE local XML for {name} from NetBox")
+        if state != "shut off":
+            print(f"REQUIRES SHUTDOWN: {name} is {state}")
         for path in sorted(removed_paths):
             print(f"WOULD {'PURGE' if purge else 'KEEP'} detached disk {path}")
         return
