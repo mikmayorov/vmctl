@@ -83,6 +83,38 @@ class ComponentTests(unittest.TestCase):
             self.assertEqual(len(result.findall("./devices/disk[@device='disk']")), 2)
             self.assertTrue(any("create" in command for command in calls))
 
+    def test_redefine_uses_iso_path_from_netbox_virtual_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory)
+            root_disk = storage / "guest.qcow2"
+            root_disk.touch()
+            old_iso = storage / "old.iso"
+            new_iso = storage / "new.iso"
+            old_iso.touch()
+            new_iso.touch()
+            spec = {"name": "guest", "source": "iso", "iso": str(new_iso),
+                    "memory_mb": 2048, "vcpus": 2, "disk_gb": 20,
+                    "bridge": "br0", "storage_directory": directory,
+                    "disks": [{"name": "guest", "path": str(root_disk), "size_gb": 20}],
+                    "interfaces": [{"name": "inet", "bridge": "br0", "mac_address": "52:54:00:00:00:01"}]}
+            old_xml = domain_xml({**spec, "iso": str(old_iso)}, root_disk, "br0")
+
+            def run(command, **kwargs):
+                if "domstate" in command:
+                    return SimpleNamespace(stdout="shut off\n")
+                if "dumpxml" in command:
+                    return SimpleNamespace(stdout=old_xml)
+                if "info" in command:
+                    return SimpleNamespace(stdout=json.dumps({"format": "qcow2", "virtual-size": 20 * 1024**3}))
+                return SimpleNamespace(stdout="")
+
+            with patch("vmcreate.subprocess.run", side_effect=run):
+                redefine_vm(spec, {"host": {"libvirt_uri": "qemu:///system"},
+                                   "storage": {"directory": directory}, "network": {"bridge": "br0"}},
+                            storage, False)
+            result = ET.fromstring((storage / "state/domains/guest.xml").read_text())
+            self.assertEqual(result.find("./devices/disk[@device='cdrom']/source").get("file"), str(new_iso))
+
     def test_removed_disk_file_is_kept_unless_purge_is_explicit(self):
         for purge in (False, True):
             with self.subTest(purge=purge), tempfile.TemporaryDirectory() as directory:

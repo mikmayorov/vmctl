@@ -290,6 +290,19 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
                 raise ValueError("no free virtio disk target")
             used_targets.add(target)
             _disk_element(devices, item["path"], target)
+    if vm["source"] == "iso":
+        iso_path = vm.get("iso")
+        if not iso_path or not Path(iso_path).is_file():
+            raise ValueError(f"ISO file is missing: {iso_path}")
+        cdrom = devices.find("./disk[@device='cdrom']")
+        if cdrom is None:
+            cdrom = ET.SubElement(devices, "disk", {"type": "file", "device": "cdrom"})
+            ET.SubElement(cdrom, "target", {"dev": "sda", "bus": "sata"})
+            ET.SubElement(cdrom, "readonly")
+        source = cdrom.find("source")
+        if source is None:
+            source = ET.SubElement(cdrom, "source")
+        source.set("file", iso_path)
     desired_interfaces = vm_interfaces(vm, vm.get("bridge") or config["network"]["bridge"])
     wanted = {item.get("alias") or interface_alias(item["name"]): item for item in desired_interfaces}
     current_interfaces = devices.findall("./interface[@type='bridge']")

@@ -195,6 +195,7 @@ class NetBoxTests(unittest.TestCase):
                 "version": 3, "source": "iso", "iso": "/images/installer.iso",
                 "image": None, "user_data": None, "bridge": "br1",
                 "storage_directory": "/images", "interface_name": "inet",
+                "mounted_media": [{"name": "media-sda", "target": "sda"}],
                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }},
         })
@@ -251,12 +252,13 @@ class NetBoxTests(unittest.TestCase):
             patch("netbox.vm_interfaces", return_value=[]),
             patch("netbox._request", side_effect=request),
         ):
-            netbox.create_vm_components({}, record, mac="52:54:00:12:34:56")
+            netbox.create_vm_components({"storage": {"directory": "/images"}}, record, mac="52:54:00:12:34:56")
         self.assertEqual([item[1].split("?")[0] for item in calls], [
             "virtualization/virtual-disks/", "virtualization/interfaces/",
             "dcim/mac-addresses/", "dcim/mac-addresses/", "virtualization/interfaces/8/",
         ])
         self.assertEqual(calls[3][2]["assigned_object_type"], "virtualization.vminterface")
+        self.assertEqual(calls[0][2]["description"], "/images/test-vm.qcow2")
 
     def test_config_with_key_requires_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,6 +1,8 @@
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import netbox
@@ -13,7 +15,7 @@ LOCAL = {
     "disks": [{"path": "/images/guest.qcow2", "target": "vda", "size_mb": 20480},
               {"path": "/images/data.qcow2", "target": "vdb", "size_mb": 5121}],
     "interfaces": [{"name": "inet", "bridge": "br0", "mac_address": "52:54:00:00:00:01"}],
-    "mounted_media": [{"path": "/images/install.iso", "target": "sda"}],
+    "mounted_media": [{"path": "/images/install.iso", "target": "sda", "size_mb": 1024}],
     "display": {"type": "none"},
 }
 RECORD = {"id": 42, "name": "guest", "serial": "", "vcpus": 2, "memory": 2048,
@@ -22,6 +24,45 @@ RECORD = {"id": 42, "name": "guest", "serial": "", "vcpus": 2, "memory": 2048,
 
 
 class AdoptReconcileTests(unittest.TestCase):
+    def test_netbox_spec_excludes_iso_from_libvirt_writable_disks(self):
+        record = {**RECORD, "serial": UUID, "disk": 21504,
+                  "local_context_data": {"vmctl": {"version": 3, "source": "existing",
+                    "mounted_media": [{"name": "media-sda", "target": "sda"}]}}}
+        disks = [{"id": 5, "name": "guest", "size": 20480,
+                  "description": "/images/guest.qcow2"},
+                 {"id": 6, "name": "media-sda", "size": 1024,
+                  "description": "/images/install.iso"}]
+        with patch("netbox.vm_disks", return_value=disks), \
+             patch("netbox.vm_interfaces", return_value=[]):
+            spec = netbox.local_spec_from_netbox(record, {})
+        self.assertEqual([item["path"] for item in spec["disks"]], ["/images/guest.qcow2"])
+        self.assertEqual(spec["disk_gb"], 20)
+        self.assertEqual(spec["mounted_media"], [{"name": "media-sda", "path": "/images/install.iso",
+                                                   "target": "sda", "size_mb": 1024}])
+
+    def test_prepare_registers_iso_as_virtual_disk_with_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            iso = Path(directory) / "install.iso"
+            iso.write_bytes(b"iso")
+            record = {"id": 42, "name": "guest", "disk": 20480,
+                      "local_context_data": {"vmctl": {"source": "iso", "iso": str(iso)}}}
+            requests = []
+            def request(_config, method, path, payload=None):
+                requests.append((method, path, payload))
+                if path == "virtualization/interfaces/":
+                    return {"id": 8, "name": "inet"}
+                if path == "dcim/mac-addresses/":
+                    return {"id": 9}
+                return {}
+            with patch("netbox.vm_disks", return_value=[]), \
+                 patch("netbox.vm_interfaces", return_value=[]), \
+                 patch("netbox._request", side_effect=request):
+                netbox.create_vm_components({"storage": {"directory": directory}}, record,
+                                            mac="52:54:00:00:00:01", root_size_mb=20480)
+        media = next(item[2] for item in requests if item[1] == "virtualization/virtual-disks/"
+                     and item[2]["name"] == "media-sda")
+        self.assertEqual((media["description"], media["size"]), (str(iso), 1))
+
     def test_dry_run_plans_existing_vm_with_media_without_writes(self):
         with patch("netbox.vm_disks", return_value=[]), \
              patch("netbox.vm_interfaces", return_value=[]), \
@@ -51,10 +92,15 @@ class AdoptReconcileTests(unittest.TestCase):
         vm_changes = calls[0][1]
         self.assertEqual(vm_changes["serial"], UUID)
         self.assertEqual((vm_changes["vcpus"], vm_changes["memory"]), (4, 4096))
-        self.assertEqual(vm_changes["local_context_data"]["vmctl"]["mounted_media"], LOCAL["mounted_media"])
+        self.assertEqual(vm_changes["local_context_data"]["vmctl"]["mounted_media"],
+                         [{"name": "media-sda", "target": "sda"}])
         self.assertEqual(vm_changes["local_context_data"]["vmctl"]["interface_bridges"], {"public": "br0"})
-        self.assertIn(("PATCH", "virtualization/virtual-disks/5/", {"size": 20480}), calls)
-        self.assertIn(("add", "disk", {"virtual_machine": 42, "name": "disk-vdb", "size": 5121}), calls)
+        self.assertIn(("PATCH", "virtualization/virtual-disks/5/",
+                       {"size": 20480, "description": "/images/guest.qcow2"}), calls)
+        self.assertIn(("add", "disk", {"virtual_machine": 42, "name": "disk-vdb", "size": 5121,
+                                        "description": "/images/data.qcow2"}), calls)
+        self.assertIn(("add", "disk", {"virtual_machine": 42, "name": "media-sda", "size": 1024,
+                                        "description": "/images/install.iso"}), calls)
         ips.assert_not_called()
         self.assertFalse(any(item[0] == "add" and item[1] == "nic" for item in calls))
 

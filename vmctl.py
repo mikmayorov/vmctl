@@ -340,6 +340,8 @@ def component_command(config: dict, args: argparse.Namespace) -> int:
     component_name = args.name
     if not COMPONENT_NAME.fullmatch(component_name):
         raise ValueError("component name must contain only letters, digits, dots, underscores or hyphens")
+    if kind == "disk" and component_name.startswith("media-"):
+        raise ValueError("media-* names are reserved for mounted ISO/CD-ROM virtual disks")
     if kind == "disk" and action == "add" and (args.size_gb <= 0):
         raise ValueError("--size-gb must be positive")
     bridge = getattr(args, "bridge", None)
@@ -380,7 +382,8 @@ def component_command(config: dict, args: argparse.Namespace) -> int:
         if action == "add":
             if kind == "disk" and not found:
                 add_component(config, "disk", {"virtual_machine": record["id"],
-                                               "name": component_name, "size": args.size_gb * 1024})
+                                               "name": component_name, "size": args.size_gb * 1024,
+                                               "description": str(candidate)})
             elif kind == "nic":
                 if not found:
                     found = add_component(config, "nic", {"virtual_machine": record["id"],
@@ -569,6 +572,7 @@ def audit(config: dict) -> int:
                     try:
                         spec = local_spec_from_netbox(vm, config)
                         expected.update({field: spec[field] for field in ("description", "display")})
+                        expected["disk_mb"] = sum(item["size_mb"] for item in spec["disks"])
                         if {item["path"] for item in spec["disks"]} != set(local["disk_paths"]):
                             print(f"DIFF {name} disks: NetBox and local disk paths differ")
                             problems += 1
@@ -578,7 +582,11 @@ def audit(config: dict) -> int:
                                for item in spec["disks"]):
                             print(f"DIFF {name} disk sizes: NetBox and local capacities differ")
                             problems += 1
-                        if context.get("source") == "existing" and context.get("mounted_media", []) != local.get("mounted_media", []):
+                        wanted_media = [{key: item[key] for key in ("path", "target", "size_mb") if key in item}
+                                        for item in spec.get("mounted_media", [])]
+                        observed_media = [{key: item[key] for key in ("path", "target", "size_mb") if key in item}
+                                          for item in local.get("mounted_media", [])]
+                        if context.get("source") != "cloud_image" and wanted_media != observed_media:
                             print(f"DIFF {name} mounted media: NetBox and local CD-ROM sources differ")
                             problems += 1
                         wanted_nics = {(item["bridge"], item["mac_address"].lower()) for item in spec["interfaces"]}
@@ -721,6 +729,9 @@ def check_vm(config: dict, name: str) -> int:
     print(f"Диски: {len(vm['disks'])}; общий размер: {vm['disk_mb']} MiB")
     for disk in vm["disks"]:
         print(f"  {disk['target']}: {disk['size_gb']} GiB; {disk['path'] or '-'}")
+    print(f"ISO/CD-ROM: {len(vm.get('mounted_media', []))}")
+    for media in vm.get("mounted_media", []):
+        print(f"  {media.get('target') or '-'}: {media.get('size_mb', '?')} MiB; {media['path']}")
     print(f"Интерфейсы: {len(vm['interfaces'])}")
     for interface in vm["interfaces"]:
         print(f"  {interface['name']}: MAC {interface['mac_address'] or '-'}; "
@@ -884,6 +895,8 @@ def main() -> int:
                 if args.dry_run:
                     print(f"NetBox: create planned VM {request_vm['name']} on device {config['netbox']['device']}")
                     print(f"NetBox: create virtual disk, interface {request_vm.get('interface_name', 'inet')} and primary MAC")
+                    if request_vm["source"] == "iso":
+                        print(f"NetBox: create Virtual Disk media-sda for ISO {request_vm['iso']}")
                     if args.command == "prepare":
                         return 0
                     plan = {

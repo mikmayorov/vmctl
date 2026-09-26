@@ -218,12 +218,34 @@ def create_vm_components(config: dict, record: dict, interface_name: str = "inet
     vm_id = record["id"]
     disks = vm_disks(config, vm_id)
     if not disks:
+        directory = config.get("storage", {}).get("directory")
+        if not directory:
+            raise NetBoxError("config needs storage.directory for the VM disk path")
         _request(config, "POST", "virtualization/virtual-disks/", {
             "virtual_machine": vm_id, "name": record["name"], "size": root_size_mb or int(record["disk"]),
+            "description": str(Path(directory) / f"{record['name']}.qcow2"),
         })
     elif not any(item["name"] == record["name"] and (root_size_mb is None or int(item["size"]) == root_size_mb)
                  for item in disks):
         raise NetBoxError(f"NetBox disks for {record['name']} differ from the VM request")
+    context = (record.get("local_context_data") or {}).get("vmctl") or {}
+    if context.get("source") == "iso":
+        iso = context.get("iso")
+        if not isinstance(iso, str) or not Path(iso).is_absolute():
+            raise NetBoxError(f"VM {record['name']}: ISO path is missing")
+        try:
+            size = (Path(iso).stat().st_size + 1024**2 - 1) // 1024**2
+        except OSError as error:
+            raise NetBoxError(f"VM {record['name']}: cannot read ISO size: {error}") from error
+        if size <= 0:
+            raise NetBoxError(f"VM {record['name']}: ISO is empty")
+        media = next((item for item in disks if item["name"] == "media-sda"), None)
+        if media is None:
+            _request(config, "POST", "virtualization/virtual-disks/", {
+                "virtual_machine": vm_id, "name": "media-sda", "size": size, "description": iso,
+            })
+        elif int(media["size"]) != size or media.get("description") != iso:
+            raise NetBoxError(f"VM {record['name']}: ISO Virtual Disk differs from the preparation request")
     interfaces = vm_interfaces(config, vm_id)
     if not interfaces:
         interface = _request(config, "POST", "virtualization/interfaces/", {
@@ -253,6 +275,19 @@ def _list_results(config: dict, path: str) -> list[dict]:
     return records
 
 
+def named_media(vm: dict) -> list[dict]:
+    result = []
+    for index, item in enumerate(vm.get("mounted_media", [])):
+        target = item.get("target")
+        name = f"media-{target}" if target else f"media-{index + 1}"
+        if not COMPONENT_NAME.fullmatch(name) or not item.get("path") or not item.get("size_mb"):
+            raise NetBoxError(f"VM {vm['name']}: mounted ISO/media needs path, target and readable size")
+        result.append({**item, "name": name})
+    if len({item["name"] for item in result}) != len(result):
+        raise NetBoxError(f"VM {vm['name']}: duplicate mounted media targets")
+    return result
+
+
 def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     """Document a pre-existing local VM without changing libvirt."""
     validate_import_vm(vm)
@@ -263,19 +298,18 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     serial = str(uuid.UUID(vm["uuid"]))
     named_disks = [{**item, "name": vm["name"] if index == 0 else f"disk-{index + 1}"}
                    for index, item in enumerate(local_disks)]
+    media_disks = named_media(vm)
     named_interfaces = [{**item, "name": item.get("name") or ("inet" if index == 0 else f"net-{index + 1}")}
                         for index, item in enumerate(local_interfaces)]
     payload = {
         "name": vm["name"], "serial": serial, "cluster": cluster_id, "device": device_id,
         "status": vm["status"], "vcpus": vm["vcpus"],
-        "memory": vm["memory_mb"], "disk": vm["disk_mb"],
+        "memory": vm["memory_mb"], "disk": vm["disk_mb"] + sum(item["size_mb"] for item in media_disks),
         "description": vm.get("description", ""),
         "start_on_boot": "on" if vm["autostart"] else "off",
         "local_context_data": {"vmctl": {
             "version": 3, "source": "existing", "bridge": vm.get("bridge"),
-            "disk_paths": vm["disk_paths"],
-            "disk_paths_by_name": {item["name"]: item["path"] for item in named_disks},
-            "mounted_media": vm.get("mounted_media", []),
+            "mounted_media": [{"name": item["name"], "target": item["target"]} for item in media_disks],
             "interface_bridges": {item["name"]: item["bridge"] for item in named_interfaces},
             "interface_name": "inet", "display": vm.get("display"),
         }},
@@ -284,7 +318,12 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     record = _request(config, "POST", "virtualization/virtual-machines/", payload)
     for item in named_disks:
         add_component(config, "disk", {"virtual_machine": record["id"],
-                                       "name": item["name"], "size": item.get("size_mb") or item["size_gb"] * 1024})
+                                       "name": item["name"], "size": item.get("size_mb") or item["size_gb"] * 1024,
+                                       "description": item["path"]})
+    for item in media_disks:
+        add_component(config, "disk", {"virtual_machine": record["id"],
+                                       "name": item["name"], "size": item["size_mb"],
+                                       "description": item["path"]})
     for item in named_interfaces:
         interface = add_component(config, "nic", {"virtual_machine": record["id"],
                                                  "name": item["name"], "enabled": True})
@@ -300,6 +339,7 @@ def validate_adopt_devices(vm: dict) -> None:
 
 def validate_import_vm(vm: dict) -> None:
     validate_adopt_devices(vm)
+    named_media(vm)
     try:
         uuid.UUID(vm["uuid"])
     except (KeyError, TypeError, ValueError, AttributeError) as error:
@@ -321,6 +361,7 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
     disks = sorted(vm_disks(config, vm_id), key=lambda item: item["id"])
     interfaces = sorted(vm_interfaces(config, vm_id), key=lambda item: item["id"])
     local_disks = vm.get("disks", [])
+    media_disks = named_media(vm)
     local_interfaces = vm.get("interfaces", [])
     if any(not item.get("path") or not item.get("size_mb") for item in local_disks):
         raise NetBoxError(f"VM {vm['name']}: disk path or capacity is missing")
@@ -332,21 +373,35 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
     if not isinstance(old_paths, dict):
         raise NetBoxError(f"VM {vm['name']}: invalid disk_paths_by_name in NetBox")
     disk_by_name = {item["name"]: item for item in disks}
+    old_media_names = {item.get("name") for item in context.get("mounted_media", []) if isinstance(item, dict)}
+    regular_existing = [item for item in disks if item["name"] not in old_media_names
+                        and not item["name"].startswith("media-")]
     disk_plan = []
     used_disks = set()
     for index, local in enumerate(local_disks):
-        match = next((item for item in disks if old_paths.get(item["name"]) == local["path"]
+        match = next((item for item in regular_existing if (item.get("description") or old_paths.get(item["name"])) == local["path"]
                       and item["id"] not in used_disks), None)
         if match is None:
             candidate = vm["name"] if index == 0 else f"disk-{local['target']}"
             match = disk_by_name.get(candidate)
             if match and match["id"] in used_disks:
                 match = None
-        if match is None and index < len(disks) and disks[index]["id"] not in used_disks:
-            match = disks[index]
+        if match is None and index < len(regular_existing) and regular_existing[index]["id"] not in used_disks:
+            match = regular_existing[index]
         name = match["name"] if match else (vm["name"] if index == 0 else f"disk-{local['target']}")
         if not COMPONENT_NAME.fullmatch(name):
             raise NetBoxError(f"VM {vm['name']}: invalid disk name {name!r}")
+        if match:
+            used_disks.add(match["id"])
+        disk_plan.append((local, match, name))
+    for local in media_disks:
+        match = next((item for item in disks if item["id"] not in used_disks
+                      and item.get("description") == local["path"]), None)
+        if match is None:
+            match = disk_by_name.get(local["name"])
+            if match and match["id"] in used_disks:
+                match = None
+        name = match["name"] if match else local["name"]
         if match:
             used_disks.add(match["id"])
         disk_plan.append((local, match, name))
@@ -375,12 +430,13 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
 
     new_context = {**context, "version": 3, "source": "existing",
                    "bridge": local_interfaces[0]["bridge"] if local_interfaces else None,
-                   "disk_paths": [item["path"] for item in local_disks],
-                   "disk_paths_by_name": {name: item["path"] for item, _, name in disk_plan},
                    "interface_bridges": {name: item["bridge"] for item, _, name in nic_plan},
                    "interface_name": nic_plan[0][2] if nic_plan else None,
-                   "mounted_media": vm.get("mounted_media", []),
+                   "mounted_media": [{"name": name, "target": item["target"]}
+                                     for item, _, name in disk_plan[len(local_disks):]],
                    "display": vm.get("display")}
+    new_context.pop("disk_paths_by_name", None)
+    new_context.pop("disk_paths", None)
     changes = {"vcpus": vm["vcpus"], "memory": vm["memory_mb"],
                "description": vm.get("description", ""),
                "start_on_boot": "on" if vm["autostart"] else "off",
@@ -401,7 +457,8 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
 
     changes = {key: value for key, value in changes.items() if saved_value(key) != value}
     disk_changes = [(local, match, name) for local, match, name in disk_plan
-                    if match is None or int(match["size"]) != local["size_mb"]]
+                    if match is None or int(match["size"]) != local["size_mb"]
+                    or match.get("description") != local["path"]]
     nic_changes = [(local, match, name) for local, match, name in nic_plan
                    if match is None or (match.get("primary_mac_address") or {}).get("mac_address", "").lower()
                    != local["mac_address"].lower()]
@@ -413,15 +470,22 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
           f"disks {len(disk_changes)} changed/{len(stale_disks)} removed, "
           f"interfaces {len(nic_changes)} changed/{len(stale_nics)} removed, "
           f"ISO/media {len(vm.get('mounted_media', []))}")
+    for local, match, name in disk_changes:
+        print(f"  {'UPDATE' if match else 'ADD'} Virtual Disk {name}: "
+              f"{local['size_mb']} MiB; Description {local['path']}")
+    for item in stale_disks:
+        print(f"  REMOVE Virtual Disk {item['name']}")
     if dry_run:
         return True
     if changes:
         patch_vm(config, vm_id, {**changes, "changelog_message": "vmctl adopted current libvirt VM state"})
     for local, match, name in disk_changes:
         if match:
-            _request(config, "PATCH", f"virtualization/virtual-disks/{match['id']}/", {"size": local["size_mb"]})
+            _request(config, "PATCH", f"virtualization/virtual-disks/{match['id']}/",
+                     {"size": local["size_mb"], "description": local["path"]})
         else:
-            add_component(config, "disk", {"virtual_machine": vm_id, "name": name, "size": local["size_mb"]})
+            add_component(config, "disk", {"virtual_machine": vm_id, "name": name,
+                                           "size": local["size_mb"], "description": local["path"]})
     for item in stale_disks:
         remove_component(config, "disk", item["id"])
     for local, match, name in nic_changes:
@@ -470,6 +534,7 @@ def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
                 "bridge": bridge,
                 "storage_directory": storage_directory,
                 "interface_name": vm.get("interface_name", "inet"),
+                "mounted_media": [{"name": "media-sda", "target": "sda"}] if vm["source"] == "iso" else [],
                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }
         },
@@ -506,8 +571,8 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         raise NetBoxError("NetBox VM lacks name, vCPUs, memory or disk") from error
     if not isinstance(context, dict) or context.get("version") not in (1, 2, 3):
         raise NetBoxError("NetBox VM has no supported vmctl context")
-    if disk_mb < 0 or (disk_mb % 1024 and context.get("source") != "existing") or memory <= 0 or vcpus <= 0 or vcpus_value != vcpus:
-        raise NetBoxError("NetBox VM sizing must be valid; new VM disks must be whole GiB")
+    if disk_mb < 0 or memory <= 0 or vcpus <= 0 or vcpus_value != vcpus:
+        raise NetBoxError("NetBox VM sizing must be valid")
     result = {
         "name": name,
         "uuid": vm_serial_uuid(record),
@@ -528,6 +593,26 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         disks = vm_disks(config, record["id"])
         if not disks or sum(int(item["size"]) for item in disks) != disk_mb:
             raise NetBoxError(f"NetBox disks for {record['name']} must match VM disk total")
+        media_context = context.get("mounted_media") or []
+        if not isinstance(media_context, list):
+            raise NetBoxError("vmctl mounted_media must be a list")
+        media_names = {item.get("name") for item in media_context if isinstance(item, dict) and item.get("name")}
+        media_by_name = {item["name"]: item for item in disks if item["name"] in media_names}
+        wanted_media = []
+        for item in media_context:
+            if not isinstance(item, dict):
+                raise NetBoxError("vmctl mounted_media contains an invalid entry")
+            media_disk = media_by_name.get(item.get("name"))
+            if media_disk:
+                path = media_disk.get("description")
+                if not isinstance(path, str) or not Path(path).is_absolute():
+                    raise NetBoxError(f"media Virtual Disk {media_disk['name']!r} needs an absolute path in Description")
+                wanted_media.append({"name": media_disk["name"], "path": path,
+                                     "target": item.get("target"), "size_mb": int(media_disk["size"])})
+            elif item.get("path"):
+                wanted_media.append(item)
+            else:
+                raise NetBoxError(f"media Virtual Disk {item.get('name')!r} is missing")
         directory = context.get("storage_directory") or config.get("storage", {}).get("directory")
         paths = context.get("disk_paths_by_name") or {}
         if not isinstance(paths, dict):
@@ -535,13 +620,15 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         legacy_paths = context.get("disk_paths") or []
         wanted_disks = []
         for item in disks:
+            if item["name"] in media_names:
+                continue
             disk_name = item["name"]
             if not isinstance(disk_name, str) or not COMPONENT_NAME.fullmatch(disk_name):
                 raise NetBoxError(f"invalid NetBox disk name: {disk_name!r}")
             size = int(item["size"])
             if size <= 0 or (size % 1024 and context.get("source") != "existing"):
                 raise NetBoxError(f"disk {disk_name!r} must have a positive size in MiB; new disks require whole GiB")
-            path = paths.get(disk_name)
+            path = item.get("description") or paths.get(disk_name)
             if not path and disk_name == name and legacy_paths:
                 path = legacy_paths[0]
             if not path:
@@ -585,10 +672,13 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         result.update({
             "description": record.get("description") or "",
             "disks": wanted_disks,
+            "mounted_media": wanted_media,
             "interfaces": wanted_interfaces,
-            "disk_gb": disk_mb // 1024,
+            "disk_gb": sum(item["size_mb"] for item in wanted_disks) // 1024,
             "display": context.get("display"),
         })
+        if context.get("source") == "iso" and wanted_media:
+            result["iso"] = wanted_media[0]["path"]
         if wanted_interfaces:
             result["interface_name"] = wanted_interfaces[0]["name"]
             result["mac_address"] = wanted_interfaces[0]["mac_address"]
