@@ -188,7 +188,7 @@ class NetBoxTests(unittest.TestCase):
             "name": "test-vm", "cluster": 7, "device": 12, "status": "planned", "start_on_boot": "off",
             "vcpus": 2, "memory": 2048, "disk": 20480, "description": "",
             "local_context_data": {"vmctl": {
-                "version": 2, "source": "iso", "iso": "/images/installer.iso",
+                "version": 3, "source": "iso", "iso": "/images/installer.iso",
                 "image": None, "user_data": None, "bridge": "br1",
                 "storage_directory": "/images", "interface_name": "inet",
                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
@@ -246,11 +246,11 @@ class NetBoxTests(unittest.TestCase):
             patch("netbox._request", side_effect=request),
         ):
             netbox.create_vm_components({}, record, mac="52:54:00:12:34:56")
-        self.assertEqual([item[1] for item in calls], [
+        self.assertEqual([item[1].split("?")[0] for item in calls], [
             "virtualization/virtual-disks/", "virtualization/interfaces/",
-            "dcim/mac-addresses/", "virtualization/interfaces/8/",
+            "dcim/mac-addresses/", "dcim/mac-addresses/", "virtualization/interfaces/8/",
         ])
-        self.assertEqual(calls[2][2]["assigned_object_type"], "virtualization.vminterface")
+        self.assertEqual(calls[3][2]["assigned_object_type"], "virtualization.vminterface")
 
     def test_config_with_key_requires_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -437,6 +437,7 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.load_config", return_value=config),
             patch("vmctl.find_device", return_value=(12, 7)),
             patch("vmctl.get_vm", return_value={"id": 42, "status": {"value": "planned"}}),
+            patch("vmctl.vm_interfaces", return_value=[]),
             patch("vmctl.local_spec_from_netbox", return_value=local_spec),
             patch("vmctl.subprocess.run", return_value=SimpleNamespace(stdout="", returncode=0)),
             patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox")),
@@ -461,6 +462,7 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.load_config", return_value=config),
             patch("vmctl.find_device", return_value=(12, 7)),
             patch("vmctl.get_vm", return_value=record),
+            patch("vmctl.vm_interfaces", return_value=[]),
             patch("vmctl.local_spec_from_netbox", return_value=plan),
             patch("vmctl.verify_local_vm") as verify,
             patch("vmctl.create_vm") as create,
@@ -486,6 +488,7 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.load_config", return_value=config),
             patch("vmctl.find_device", return_value=(12, 7)),
             patch("vmctl.get_vm", return_value=record),
+            patch("vmctl.vm_interfaces", return_value=[]),
             patch("vmctl.local_spec_from_netbox", return_value=plan),
             patch("vmctl.verify_local_vm", side_effect=[ValueError("drift"), None]) as verify,
             patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox")),

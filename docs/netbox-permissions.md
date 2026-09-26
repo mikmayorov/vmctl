@@ -1,41 +1,35 @@
 # Права NetBox для vmctl
 
-Для каждого хоста создавайте отдельного пользователя NetBox, отдельную группу и отдельный API-токен. Группа задаёт права на **одно устройство хоста и ВМ, закреплённые за ним**. Одну группу с неограниченными правами для всех хостов использовать нельзя: любой её участник получит доступ ко всем объектам указанных типов. Токен действует с правами пользователя, а не задаёт собственные ограничения на объекты. [Модель прав NetBox](https://netboxlabs.com/docs/netbox/v4.4/administration/permissions/), [модель токена](https://netboxlabs.com/docs/netbox/models/users/token/).
+Для всех хостов создайте **одну группу** пользователей `vmctl-hosts` и назначьте ей пять разрешений ниже. На каждый хост создавайте отдельного пользователя и API-токен. Создайте для хоста запись **Owner**, включите в неё этого пользователя и назначьте Owner устройству хоста (`Device`). Разрешения через `$user` проверяют владельца устройства, к которому привязана ВМ. Эта схема требует NetBox 4.5 или новее. [Owner и ограничения прав](https://netboxlabs.com/blog/netbox-object-owner-functionality/).
 
-## Подготовка
+## Настройка общей группы
 
-1. Администратор NetBox создаёт кластер и устройство хоста, затем назначает устройство хостом этого кластера. `vmctl` сам их не создаёт.
-2. Запишите точное имя устройства и slug площадки. Ниже они обозначены `HOST_NAME` и `SITE_SLUG`. Используйте те же значения в `netbox.device` и `netbox.site` файла `config.toml` на хосте.
-3. Создайте обычного пользователя, например `vmctl-HOST_NAME`. Не включайте `Staff` и `Superuser`. Создайте группу `vmctl-HOST_NAME` и добавьте в неё только этого пользователя.
+В **Admin → Authentication → Permissions** создайте пять разрешений, назначив **группу `vmctl-hosts` каждому**. Не оставляйте поля Users и Groups пустыми: тогда правило не действует. Не назначайте правила напрямую отдельному API-пользователю. В Constraints вводите JSON с двойными кавычками.
 
-В разделе **Admin → Authentication → Permissions** создайте для группы шесть объектных разрешений. Названия разделов UI могут отличаться между версиями NetBox. В каждой строке ниже выберите **ровно один тип объекта**, указанные действия и JSON в поле **Constraints**. Подставьте имя и площадку своего хоста; кавычки и двойные подчёркивания оставьте как в примере.
-
-| Тип объекта NetBox | Действия | Constraints |
+| Тип объекта | Действия | Constraints |
 | --- | --- | --- |
-| `DCIM → Device` | `view` | `{"name":"HOST_NAME","site__slug":"SITE_SLUG"}` |
-| `Virtualization → Virtual machine` | `view`, `add`, `change` | `{"device__name":"HOST_NAME","device__site__slug":"SITE_SLUG"}` |
-| `Virtualization → Virtual disk` | `view`, `add` | `{"virtual_machine__device__name":"HOST_NAME","virtual_machine__device__site__slug":"SITE_SLUG"}` |
-| `Virtualization → VM interface` | `view`, `add`, `change` | `{"virtual_machine__device__name":"HOST_NAME","virtual_machine__device__site__slug":"SITE_SLUG"}` |
-| `DCIM → MAC address` | `view`, `add` | `{"vminterface__virtual_machine__device__name":"HOST_NAME","vminterface__virtual_machine__device__site__slug":"SITE_SLUG"}` |
-| `IPAM → IP address` | `view` | `{"vminterface__virtual_machine__device__name":"HOST_NAME","vminterface__virtual_machine__device__site__slug":"SITE_SLUG"}` |
+| `dcim.device` | `view` | `{"owner__users":"$user"}` |
+| `virtualization.virtualmachine` | `view`, `add`, `change`, `delete` | `{"device__owner__users":"$user"}` |
+| `virtualization.virtualdisk`, `virtualization.vminterface` | `view`, `add`, `change`, `delete` | `{"virtual_machine__device__owner__users":"$user"}` |
+| `dcim.macaddress` | `view`, `add`, `change`, `delete` | `{"vminterface__virtual_machine__device__owner__users":"$user"}` |
+| `ipam.ipaddress` | `view` | `{"vminterface__virtual_machine__device__owner__users":"$user"}` |
 
-Это **шесть** разрешений: для каждого типа свой путь к устройству. У MAC и IP поле назначения полиморфное; `vminterface` — обратная связь NetBox с интерфейсом ВМ. `vmctl` создаёт и читает MAC, а затем меняет **интерфейс ВМ**, назначая MAC основным. `vmctl` читает IP, но не создаёт и не меняет их. Для дисков и интерфейсов `view` нужен для проверки существующих объектов перед `add`. `change` требуется для ВМ (статус, параметры) и интерфейса (primary MAC). `delete` нигде не требуется. [Связь MAC/IP с VM interface в модели NetBox](https://github.com/netbox-community/netbox/blob/main/netbox/virtualization/models/virtualmachines.py).
+Здесь Virtual disk и VM interface объединены в одно правило, потому что путь к устройству у них одинаковый. MAC и IP имеют полиморфную связь с интерфейсом ВМ; `vminterface` — обратная связь модели NetBox. `vmctl` читает IP, но не назначает и не меняет их. Права `change` и `delete` нужны для управления компонентами и удаления ВМ. [Объектные разрешения NetBox](https://netboxlabs.com/docs/netbox/v4.4/administration/permissions/), [связи VM interface](https://github.com/netbox-community/netbox/blob/main/netbox/virtualization/models/virtualmachines.py).
 
-Если на одной площадке возможны два устройства с одинаковым именем, добавьте в **каждый** JSON ещё условие на tenant устройства, например `"device__tenant__slug":"TENANT_SLUG"` для ВМ, `"virtual_machine__device__tenant__slug":"TENANT_SLUG"` для диска/интерфейса и `"vminterface__virtual_machine__device__tenant__slug":"TENANT_SLUG"` для MAC/IP. Для самого Device используйте `"tenant__slug":"TENANT_SLUG"`. Аналогично задайте `netbox.tenant` в `config.toml`. Если tenant отсутствует, вместо slug можно использовать `null` с суффиксом `__isnull`: например `"device__tenant__isnull":true`.
+Проверьте, что API-пользователь не получает широкие права через другие группы, прямые назначения или `DEFAULT_PERMISSIONS`: NetBox объединяет подходящие разрешения по «ИЛИ». Запись Owner должна включать **конкретного пользователя хоста**, а не общую группу `vmctl-hosts`: иначе все хосты станут владельцами всех таких устройств.
 
-NetBox объединяет несколько разрешений для одного типа объекта по **ИЛИ**. Поэтому проверьте, что пользователь не получает более широких прав через другие группы, прямые разрешения или `DEFAULT_PERMISSIONS`. `$user` в ограничениях означает самого пользователя, но не раскрывает его свойства вроде «привязанного device»; одной общей группе нельзя задать разные device по этому шаблону. [Правила объединения ограничений](https://netboxlabs.com/docs/netbox/v4.4/administration/permissions/).
+## Подключение нового хоста
 
-## Токен и проверка
+1. Администратор создаёт кластер и устройство хоста, привязывает устройство к кластеру.
+2. Создаёт обычного пользователя `vmctl-ИМЯ_ХОСТА`, добавляет его в `vmctl-hosts`. Флаги Staff и Superuser ему не нужны.
+3. Создаёт отдельный Owner для хоста, добавляет в Owner этого пользователя и назначает Owner устройству хоста. Owner самой ВМ назначать не требуется: право проходит через её `device`.
+4. Создаёт пользователю API-токен v2 с **Write enabled**. При необходимости задаёт Allowed IPs и срок действия. Кладёт токен на хост в `/opt/vmctl/netbox.key` с правами `600`.
+5. Указывает в `config.toml` URL NetBox, имя device и при необходимости slug site/tenant; запускает `vmctl doctor`.
 
-Создайте для этого пользователя API-токен v2 с **Write enabled**. По возможности укажите срок действия и **Allowed IPs**: внешний адрес, с которого этот хост выходит к NetBox. Токен запишите на хосте в `/opt/vmctl/netbox.key` с правами `600`; не помещайте его в Git. Если используете файл, уберите прежний `netbox.key` из `config.toml` и проверьте, что не задан `NETBOX_TOKEN`: переменная окружения и ключ в конфигурации имеют приоритет перед файлом. При замене токена сначала запишите новый на хосте, проверьте `vmctl doctor`, затем отзовите старый. [Поля токена NetBox](https://netboxlabs.com/docs/netbox/models/users/token/).
+Если используете файл `netbox.key`, уберите ключ из `config.toml` и проверьте, что не задан `NETBOX_TOKEN`: они имеют приоритет перед файлом. [Поля API-токена](https://netboxlabs.com/docs/netbox/models/users/token/).
 
-```bash
-cd /opt/vmctl
-chmod 600 netbox.key
-vmctl doctor
-vmctl audit
-```
+## Проверка доступа и операций
 
-Проверьте права с новой тестовой ВМ: `vmctl --dry-run prepare ФАЙЛ` показывает план без записи; `vmctl prepare ФАЙЛ` создаёт в NetBox ВМ, диск, интерфейс и MAC. После этого назначьте IPv4/IPv6 интерфейсу **от имени администратора NetBox**, затем проверьте `vmctl audit` и `vmctl --dry-run sync ИМЯ`. Учёт IP в NetBox не настраивает адреса внутри гостевой ОС. Для контрольной проверки ограничения другим пользователем создайте тестовую ВМ на другом хосте и убедитесь, что API-пользователь первого хоста её не видит и не может изменить. Если NetBox отвергает `vminterface__...` в ограничении MAC или IP, проверьте версию NetBox и его модель обратной связи; не заменяйте ограничение глобальным правом ради прохождения проверки.
+На тестовой ВМ проверьте `vmctl prepare`, `vmctl sync` и `vmctl audit`, затем добавление и удаление дополнительного диска и интерфейса. IP назначьте интерфейсу вручную в NetBox IPAM; перед удалением интерфейса снимите назначенные IP там же. `vmctl` остановит удаление интерфейса с IP. Убедитесь также, что токен одного хоста не видит ВМ другого и не может её изменить. Если NetBox отвергает `vminterface__...` в ограничениях MAC/IP, проверьте версию и модель обратной связи NetBox; не заменяйте это правило глобальным правом.
 
-Если хосту нужны самостоятельные операции с IP из `vmctl` в будущем, матрицу прав и код потребуется расширить отдельно. Сейчас назначение адресов и выбор Primary IPv4/IPv6 выполняет администратор в NetBox.
+ВМ целиком удаляйте через `vmctl delete`, а не удалением записи через UI NetBox: отсутствие записи для `sync` означает расхождение, а не команду удалить локальную ВМ.

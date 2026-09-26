@@ -25,19 +25,30 @@ def inspect_vm(config: dict, name: str) -> dict:
     memory_mb = int(int(memory.text) * units[memory.get("unit", "KiB")])
     disks = root.findall("./devices/disk[@device='disk']")
     disk_paths = []
+    disk_items = []
     disk_bytes = 0
     for disk in disks:
         target = disk.find("target")
         source = disk.find("source")
         if target is None or not target.get("dev"):
             raise ValueError(f"VM {name}: disk has no target")
-        disk_paths.append((source.get("file") or source.get("dev")) if source is not None else None)
+        path = (source.get("file") or source.get("dev")) if source is not None else None
+        disk_paths.append(path)
         info = _virsh(config, "domblkinfo", name, target.get("dev"))
         capacity = next((line.split(":", 1)[1].strip() for line in info.splitlines()
                          if line.startswith("Capacity:")), None)
         if capacity is None or not capacity.isdecimal():
             raise ValueError(f"VM {name}: cannot read capacity of {target.get('dev')}")
         disk_bytes += int(capacity)
+        disk_items.append({"path": path, "target": target.get("dev"), "size_bytes": int(capacity),
+                           "size_gb": (int(capacity) + 1024**3 - 1) // 1024**3})
+    nic_items = []
+    for index, node in enumerate(root.findall("./devices/interface[@type='bridge']")):
+        source, mac, alias = node.find("source"), node.find("mac"), node.find("alias")
+        nic_items.append({"name": "inet" if index == 0 else f"net-{index + 1}",
+                          "bridge": source.get("bridge") if source is not None else None,
+                          "mac_address": mac.get("address") if mac is not None else None,
+                          "alias": alias.get("name") if alias is not None else None})
     bridge = root.find("./devices/interface[@type='bridge']/source")
     mac = root.find("./devices/interface[@type='bridge']/mac")
     graphics = root.find("./devices/graphics")
@@ -61,6 +72,8 @@ def inspect_vm(config: dict, name: str) -> dict:
         "name": name, "vcpus": int(vcpu), "memory_mb": memory_mb,
         "disk_mb": (disk_bytes + 1024**2 - 1) // 1024**2,
         "disk_paths": disk_paths,
+        "disks": disk_items,
+        "interfaces": nic_items,
         "bridge": bridge.get("bridge") if bridge is not None else None,
         "mac_address": mac.get("address") if mac is not None else None,
         "description": root.findtext("./description") or "",
