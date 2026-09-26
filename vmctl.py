@@ -9,7 +9,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import textwrap
 import tomllib
 from pathlib import Path
 
@@ -55,19 +54,19 @@ def _help_argument(parser: argparse.ArgumentParser) -> None:
     parser._positionals.title = "Аргументы"
 
 
-def _overview(groups: list[tuple[str, list[str]]], parsers: dict[str, argparse.ArgumentParser]) -> str:
-    listed = [name for _, names in groups for name in names]
+def _overview(groups: list[tuple[str, list[tuple[str, str]]]],
+              parsers: dict[str, argparse.ArgumentParser]) -> str:
+    listed = [name for _, commands in groups for name, _ in commands]
     leaves = {name for name, parser in parsers.items()
               if not any(isinstance(action, argparse._SubParsersAction) for action in parser._actions)}
     if len(listed) != len(leaves) or set(listed) != leaves:
         raise ValueError("every vmctl command must appear exactly once in the help overview")
     lines = []
-    for title, names in groups:
-        lines.extend((title + ":", ""))
-        for name in names:
+    for title, commands in groups:
+        lines.append(title + ":")
+        for name, summary in commands:
             command = parsers[name]
-            parts = [command.prog]
-            arguments = []
+            parts = [name]
             for argument in command._actions:
                 if argument.dest == "help":
                     continue
@@ -77,19 +76,15 @@ def _overview(groups: list[tuple[str, list[str]]], parsers: dict[str, argparse.A
                 synopsis = label.split(", ")[-1]
                 parts.append(synopsis if (not argument.option_strings and argument.nargs != "?")
                              or argument.required else f"[{synopsis}]")
-                arguments.append((label, argument.help))
-            lines.append("  " + " ".join(parts))
-            lines.extend(textwrap.wrap(command.description, width=88,
-                                       initial_indent="      ", subsequent_indent="      "))
-            for label, explanation in arguments:
-                lines.extend(textwrap.wrap(f"{label}: {explanation}", width=88,
-                                           initial_indent="      ", subsequent_indent="      "))
-            lines.append("")
+            synopsis = " ".join(parts)
+            if len(synopsis) <= 34:
+                lines.append(f"  {synopsis:<34} {summary}")
+            else:
+                lines.extend((f"  {synopsis}", f"  {'':34} {summary}"))
+        lines.append("")
     lines.extend((
-        "Общие параметры ставьте перед командой: vmctl --dry-run sync ИМЯ.",
-        "NetBox хранит требуемое состояние при наличии API-ключа; изменения сначала",
-        "записываются в NetBox, затем применяются к libvirt. IP назначают в NetBox IPAM.",
-        "Подробности и примеры: vmctl КОМАНДА -h, vmctl disk add -h.",
+        "Подробности: vmctl КОМАНДА -h (например, vmctl disk add -h).",
+        "При наличии ключа изменения сначала записываются в NetBox.",
     ))
     return "\n".join(lines)
 
@@ -103,9 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
     _help_argument(parser)
     parser._optionals.title = "Общие параметры"
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, metavar="ФАЙЛ",
-                        help="Путь к конфигурации хоста (по умолчанию: %(default)s)")
+                        help="Путь к config.toml хоста")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Показать план без записи в NetBox и без локальных изменений")
+                        help="Показать план без изменений")
     commands = parser.add_subparsers(dest="command", required=True, metavar="КОМАНДА", help=argparse.SUPPRESS)
     parsers = {}
 
@@ -194,10 +189,31 @@ def build_parser() -> argparse.ArgumentParser:
                                                                    help="Имя локальной ВМ")
 
     parser.epilog = _overview([
-        ("Проверка и просмотр", ["check", "audit", "list"]),
-        ("Создание и учёт в NetBox", ["prepare", "create", "sync", "adopt"]),
-        ("Диски, интерфейсы и удаление", ["disk add", "disk remove", "nic add", "nic remove", "delete"]),
-        ("Питание и автозапуск", ["start", "shutdown", "reboot", "autostart", "autostart-off"]),
+        ("Просмотр", [
+            ("list", "ВМ: питание, ресурсы, IP, дисплей"),
+            ("check", "Проверить хост или показать подробности ВМ"),
+            ("audit", "Сверить ВМ с NetBox"),
+        ]),
+        ("Создание и синхронизация", [
+            ("prepare", "Создать запись и компоненты в NetBox"),
+            ("create", "Создать запись в NetBox и локальную ВМ"),
+            ("sync", "Применить NetBox; --purge удалит файлы дисков"),
+            ("adopt", "Завести в NetBox отсутствующие локальные ВМ"),
+        ]),
+        ("Компоненты", [
+            ("disk add", "Добавить диск"),
+            ("disk remove", "Удалить диск; --purge удалит и файл"),
+            ("nic add", "Добавить интерфейс и MAC"),
+            ("nic remove", "Удалить интерфейс и MAC"),
+            ("delete", "Удалить ВМ; --purge удалит и диски"),
+        ]),
+        ("Питание", [
+            ("start", "Запустить"),
+            ("shutdown", "Штатно выключить"),
+            ("reboot", "Перезагрузить"),
+            ("autostart", "Включить автозапуск"),
+            ("autostart-off", "Выключить автозапуск"),
+        ]),
     ], parsers)
     return parser
 
