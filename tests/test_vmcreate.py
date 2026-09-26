@@ -116,6 +116,7 @@ class CreationTests(unittest.TestCase):
         with patch("inventory.subprocess.run", side_effect=command):
             observed = inventory.inspect_vm({"host": {"libvirt_uri": "qemu:///system"}}, "test-vm")
         self.assertEqual(observed["disk_mb"], 20480)
+        self.assertEqual(observed["mounted_media"], [{"path": "/images/installer.iso", "target": "sda", "size_mb": 20480}])
         self.assertEqual(observed["status"], "active")
         self.assertTrue(observed["autostart"])
 
@@ -315,7 +316,7 @@ class OperationOrderTests(unittest.TestCase):
                 vmctl.adopt(config, False)
             names.assert_not_called()
 
-    def test_adopt_imports_only_missing_vms_and_is_read_only_locally(self):
+    def test_adopt_reconciles_existing_and_imports_missing_without_local_mutation(self):
         config = {"netbox": {"key": "secret"}}
         vm = {"name": "new", "vcpus": 2, "memory_mb": 2048, "disk_mb": 10240,
               "disk_paths": ["/disk.qcow2"], "bridge": "br1", "status": "active", "autostart": True}
@@ -324,14 +325,34 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.list_vms", return_value=[{"id": 4, "name": "old"}]),
             patch("vmctl.local_names", return_value=["new", "old"]),
             patch("vmctl.find_vm", return_value=None),
+            patch("vmctl.get_vm", return_value={"id": 4, "name": "old"}),
             patch("vmctl.inspect_vm", return_value=vm),
             patch("vmctl.import_vm", return_value={"id": 5}) as imported,
+            patch("vmctl.reconcile_adopted_vm") as reconciled,
             patch("vmctl.subprocess.run") as local_change,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(vmctl.adopt(config, False), 0)
         self.assertEqual(imported.call_args.args[1]["name"], "new")
+        reconciled.assert_called_once()
         local_change.assert_not_called()
+
+    def test_adopt_named_vm_does_not_inspect_other_domains(self):
+        config = {"netbox": {"key": "secret"}}
+        vm = {"name": "chosen", "vcpus": 2, "memory_mb": 2048,
+              "disks": [], "interfaces": [], "mounted_media": []}
+        with (
+            patch("vmctl.find_device", return_value=(12, 7)),
+            patch("vmctl.list_vms", return_value=[]),
+            patch("vmctl.local_names", return_value=["chosen", "other"]),
+            patch("vmctl.find_vm", return_value=None),
+            patch("vmctl.inspect_vm", return_value=vm) as inspect,
+            patch("vmctl.import_vm", return_value={"id": 5}) as imported,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(vmctl.adopt(config, False, "chosen"), 0)
+        inspect.assert_called_once_with(config, "chosen")
+        imported.assert_called_once()
 
     def test_audit_reports_missing_and_different_vms(self):
         config = {"netbox": {"key": "secret"}}

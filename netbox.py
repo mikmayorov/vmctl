@@ -255,20 +255,12 @@ def _list_results(config: dict, path: str) -> list[dict]:
 
 def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     """Document a pre-existing local VM without changing libvirt."""
+    validate_import_vm(vm)
     local_disks = vm.get("disks") or [{"path": path, "size_gb": vm["disk_mb"] // 1024}
                                        for path in vm["disk_paths"]]
     local_interfaces = vm["interfaces"] if "interfaces" in vm else [{"name": "inet", "bridge": vm.get("bridge"),
                                                                        "mac_address": vm.get("mac_address")}]
-    if not local_disks or any(not item.get("path") or not item.get("size_gb") for item in local_disks) or \
-            any(not item.get("mac_address") for item in local_interfaces):
-        raise NetBoxError(f"VM {vm['name']} needs readable disks and MAC addresses for adoption")
-    if any(item.get("size_bytes", item["size_gb"] * 1024**3) != item["size_gb"] * 1024**3
-           for item in local_disks):
-        raise NetBoxError(f"VM {vm['name']} has a disk whose size is not a whole GiB")
-    try:
-        serial = str(uuid.UUID(vm["uuid"]))
-    except (KeyError, TypeError, ValueError, AttributeError) as error:
-        raise NetBoxError(f"VM {vm['name']} needs a readable libvirt UUID for adoption") from error
+    serial = str(uuid.UUID(vm["uuid"]))
     named_disks = [{**item, "name": vm["name"] if index == 0 else f"disk-{index + 1}"}
                    for index, item in enumerate(local_disks)]
     named_interfaces = [{**item, "name": item.get("name") or ("inet" if index == 0 else f"net-{index + 1}")}
@@ -283,6 +275,7 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
             "version": 3, "source": "existing", "bridge": vm.get("bridge"),
             "disk_paths": vm["disk_paths"],
             "disk_paths_by_name": {item["name"]: item["path"] for item in named_disks},
+            "mounted_media": vm.get("mounted_media", []),
             "interface_bridges": {item["name"]: item["bridge"] for item in named_interfaces},
             "interface_name": "inet", "display": vm.get("display"),
         }},
@@ -291,12 +284,159 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     record = _request(config, "POST", "virtualization/virtual-machines/", payload)
     for item in named_disks:
         add_component(config, "disk", {"virtual_machine": record["id"],
-                                       "name": item["name"], "size": item["size_gb"] * 1024})
+                                       "name": item["name"], "size": item.get("size_mb") or item["size_gb"] * 1024})
     for item in named_interfaces:
         interface = add_component(config, "nic", {"virtual_machine": record["id"],
                                                  "name": item["name"], "enabled": True})
         ensure_primary_mac(config, interface, item["mac_address"])
     return record
+
+
+def validate_adopt_devices(vm: dict) -> None:
+    if vm.get("unsupported_storage") or vm.get("unsupported_interfaces"):
+        raise NetBoxError(f"VM {vm['name']}: unsupported libvirt storage or interface types: "
+                          f"{vm.get('unsupported_storage', [])}, {vm.get('unsupported_interfaces', [])}")
+
+
+def validate_import_vm(vm: dict) -> None:
+    validate_adopt_devices(vm)
+    try:
+        uuid.UUID(vm["uuid"])
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise NetBoxError(f"VM {vm['name']} needs a readable libvirt UUID for adoption") from error
+    if any(not item.get("path") or not (item.get("size_mb") or item.get("size_gb", 0) * 1024)
+           for item in vm.get("disks", [])) or any(not item.get("mac_address") or not item.get("bridge")
+           for item in vm.get("interfaces", [])):
+        raise NetBoxError(f"VM {vm['name']} needs readable disks and bridge interface MAC addresses for adoption")
+
+
+def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) -> bool:
+    """Refresh an existing NetBox VM from libvirt; never change libvirt or IPAM."""
+    validate_adopt_devices(vm)
+    serial = str(uuid.UUID(vm["uuid"]))
+    saved = vm_serial_uuid(record)
+    if saved and saved != serial:
+        raise NetBoxError(f"VM {vm['name']}: NetBox Serial {saved} differs from libvirt UUID {serial}")
+    vm_id = record["id"]
+    disks = sorted(vm_disks(config, vm_id), key=lambda item: item["id"])
+    interfaces = sorted(vm_interfaces(config, vm_id), key=lambda item: item["id"])
+    local_disks = vm.get("disks", [])
+    local_interfaces = vm.get("interfaces", [])
+    if any(not item.get("path") or not item.get("size_mb") for item in local_disks):
+        raise NetBoxError(f"VM {vm['name']}: disk path or capacity is missing")
+    if any(not item.get("mac_address") or not item.get("bridge") for item in local_interfaces):
+        raise NetBoxError(f"VM {vm['name']}: interface MAC or bridge is missing")
+    data = dict(record.get("local_context_data") or {})
+    context = dict(data.get("vmctl") or {})
+    old_paths = context.get("disk_paths_by_name") or {}
+    if not isinstance(old_paths, dict):
+        raise NetBoxError(f"VM {vm['name']}: invalid disk_paths_by_name in NetBox")
+    disk_by_name = {item["name"]: item for item in disks}
+    disk_plan = []
+    used_disks = set()
+    for index, local in enumerate(local_disks):
+        match = next((item for item in disks if old_paths.get(item["name"]) == local["path"]
+                      and item["id"] not in used_disks), None)
+        if match is None:
+            candidate = vm["name"] if index == 0 else f"disk-{local['target']}"
+            match = disk_by_name.get(candidate)
+            if match and match["id"] in used_disks:
+                match = None
+        if match is None and index < len(disks) and disks[index]["id"] not in used_disks:
+            match = disks[index]
+        name = match["name"] if match else (vm["name"] if index == 0 else f"disk-{local['target']}")
+        if not COMPONENT_NAME.fullmatch(name):
+            raise NetBoxError(f"VM {vm['name']}: invalid disk name {name!r}")
+        if match:
+            used_disks.add(match["id"])
+        disk_plan.append((local, match, name))
+    stale_disks = [item for item in disks if item["id"] not in used_disks]
+
+    nic_plan = []
+    used_nics = set()
+    for index, local in enumerate(local_interfaces):
+        mac = local["mac_address"].lower()
+        match = next((item for item in interfaces
+                      if item["id"] not in used_nics and
+                      (item.get("primary_mac_address") or {}).get("mac_address", "").lower() == mac), None)
+        if match is None:
+            name = local.get("name") or ("inet" if index == 0 else f"net-{index + 1}")
+            match = next((item for item in interfaces if item["id"] not in used_nics and item["name"] == name), None)
+        name = match["name"] if match else (local.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))
+        if not COMPONENT_NAME.fullmatch(name):
+            raise NetBoxError(f"VM {vm['name']}: invalid interface name {name!r}")
+        if match:
+            used_nics.add(match["id"])
+        nic_plan.append((local, match, name))
+    stale_nics = [item for item in interfaces if item["id"] not in used_nics]
+    for item in stale_nics:
+        if interface_ips(config, item["id"]):
+            raise NetBoxError(f"VM {vm['name']}: interface {item['name']} has IP addresses; unassign them in NetBox before adoption")
+
+    new_context = {**context, "version": 3, "source": "existing",
+                   "bridge": local_interfaces[0]["bridge"] if local_interfaces else None,
+                   "disk_paths": [item["path"] for item in local_disks],
+                   "disk_paths_by_name": {name: item["path"] for item, _, name in disk_plan},
+                   "interface_bridges": {name: item["bridge"] for item, _, name in nic_plan},
+                   "interface_name": nic_plan[0][2] if nic_plan else None,
+                   "mounted_media": vm.get("mounted_media", []),
+                   "display": vm.get("display")}
+    changes = {"vcpus": vm["vcpus"], "memory": vm["memory_mb"],
+               "description": vm.get("description", ""),
+               "start_on_boot": "on" if vm["autostart"] else "off",
+               "status": vm["status"],
+               "local_context_data": {**data, "vmctl": new_context}}
+    if not saved:
+        changes["serial"] = serial
+    def saved_value(key: str):
+        value = record.get(key)
+        if isinstance(value, dict) and key in ("status", "start_on_boot"):
+            return value.get("value")
+        if key == "vcpus" and value is not None:
+            try:
+                return Decimal(str(value))
+            except InvalidOperation as error:
+                raise NetBoxError(f"VM {vm['name']}: invalid NetBox vCPU value") from error
+        return value
+
+    changes = {key: value for key, value in changes.items() if saved_value(key) != value}
+    disk_changes = [(local, match, name) for local, match, name in disk_plan
+                    if match is None or int(match["size"]) != local["size_mb"]]
+    nic_changes = [(local, match, name) for local, match, name in nic_plan
+                   if match is None or (match.get("primary_mac_address") or {}).get("mac_address", "").lower()
+                   != local["mac_address"].lower()]
+    if not (changes or disk_changes or stale_disks or nic_changes or stale_nics):
+        print(f"UNCHANGED {vm['name']}")
+        return False
+    verb = "WOULD UPDATE" if dry_run else "UPDATED"
+    print(f"{verb} {vm['name']}: fields {', '.join(changes) or '-'}, "
+          f"disks {len(disk_changes)} changed/{len(stale_disks)} removed, "
+          f"interfaces {len(nic_changes)} changed/{len(stale_nics)} removed, "
+          f"ISO/media {len(vm.get('mounted_media', []))}")
+    if dry_run:
+        return True
+    if changes:
+        patch_vm(config, vm_id, {**changes, "changelog_message": "vmctl adopted current libvirt VM state"})
+    for local, match, name in disk_changes:
+        if match:
+            _request(config, "PATCH", f"virtualization/virtual-disks/{match['id']}/", {"size": local["size_mb"]})
+        else:
+            add_component(config, "disk", {"virtual_machine": vm_id, "name": name, "size": local["size_mb"]})
+    for item in stale_disks:
+        remove_component(config, "disk", item["id"])
+    for local, match, name in nic_changes:
+        if match is None:
+            match = add_component(config, "nic", {"virtual_machine": vm_id, "name": name, "enabled": True})
+        primary = match.get("primary_mac_address")
+        if primary and primary.get("mac_address", "").lower() != local["mac_address"].lower():
+            _request(config, "PATCH", f"dcim/mac-addresses/{primary['id']}/", {"mac_address": local["mac_address"]})
+        else:
+            ensure_primary_mac(config, match, local["mac_address"])
+    for item in stale_nics:
+        for mac in interface_macs(config, item["id"]):
+            remove_component(config, "mac", mac["id"])
+        remove_component(config, "nic", item["id"])
+    return True
 
 
 def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
@@ -364,10 +504,10 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         context = record["local_context_data"]["vmctl"]
     except (KeyError, TypeError, ValueError, InvalidOperation) as error:
         raise NetBoxError("NetBox VM lacks name, vCPUs, memory or disk") from error
-    if disk_mb <= 0 or disk_mb % 1024 or memory <= 0 or vcpus <= 0 or vcpus_value != vcpus:
-        raise NetBoxError("NetBox VM sizing must be positive and disk must be whole GiB")
     if not isinstance(context, dict) or context.get("version") not in (1, 2, 3):
         raise NetBoxError("NetBox VM has no supported vmctl context")
+    if disk_mb < 0 or (disk_mb % 1024 and context.get("source") != "existing") or memory <= 0 or vcpus <= 0 or vcpus_value != vcpus:
+        raise NetBoxError("NetBox VM sizing must be valid; new VM disks must be whole GiB")
     result = {
         "name": name,
         "uuid": vm_serial_uuid(record),
@@ -399,8 +539,8 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
             if not isinstance(disk_name, str) or not COMPONENT_NAME.fullmatch(disk_name):
                 raise NetBoxError(f"invalid NetBox disk name: {disk_name!r}")
             size = int(item["size"])
-            if size <= 0 or size % 1024:
-                raise NetBoxError(f"disk {disk_name!r} must have a whole GiB size")
+            if size <= 0 or (size % 1024 and context.get("source") != "existing"):
+                raise NetBoxError(f"disk {disk_name!r} must have a positive size in MiB; new disks require whole GiB")
             path = paths.get(disk_name)
             if not path and disk_name == name and legacy_paths:
                 path = legacy_paths[0]
@@ -411,7 +551,8 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
                 path = str(Path(directory) / filename)
             if not isinstance(path, str) or not Path(path).is_absolute():
                 raise NetBoxError(f"invalid path for disk {disk_name!r}")
-            wanted_disks.append({"name": disk_name, "size_gb": size // 1024, "path": path})
+            wanted_disks.append({"name": disk_name, "size_gb": (size + 1023) // 1024,
+                                 "size_mb": size, "path": path})
         if len({item["name"] for item in wanted_disks}) != len(wanted_disks) or len({item["path"] for item in wanted_disks}) != len(wanted_disks):
             raise NetBoxError("duplicate NetBox disk name or path")
         if context.get("source") in ("iso", "cloud_image") and name not in {item["name"] for item in wanted_disks}:

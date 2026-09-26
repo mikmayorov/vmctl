@@ -16,8 +16,8 @@ from pathlib import Path
 
 from netbox import (
     NetBoxError, COMPONENT_NAME, _request, add_component, create_vm_components, ensure_primary_mac,
-    find_device, find_vm, get_vm, has_netbox_key, import_vm, interface_ips, interface_macs, list_vms,
-    local_spec_from_netbox, patch_vm, remove_component, reserve_vm, vm_disks, vm_interfaces,
+    find_device, find_vm, get_vm, has_netbox_key, import_vm, reconcile_adopted_vm, interface_ips, interface_macs, list_vms,
+    local_spec_from_netbox, patch_vm, remove_component, reserve_vm, validate_import_vm, vm_disks, vm_interfaces,
     vm_serial_uuid,
 )
 from inventory import inspect_display, inspect_vm, local_names
@@ -138,8 +138,9 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("vm", metavar="ИМЯ", help="Имя ВМ на устройстве этого хоста в NetBox")
     sync.add_argument("--purge", action="store_true",
                       help="Удалить файлы управляемых дисков, уже исключённых из записи NetBox")
-    add("adopt", "Создать в NetBox записи только для отсутствующих локальных ВМ; libvirt не меняется. Нужен API-ключ и существующее устройство хоста.",
-        "vmctl --dry-run adopt")
+    adopt_cmd = add("adopt", "Перенести фактические параметры локальных ВМ в NetBox; без имени обработать все. Libvirt не меняется.",
+                    "vmctl --dry-run adopt guest")
+    adopt_cmd.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна локальная ВМ; без имени все ВМ хоста")
 
     disk = add("disk", "Добавить или удалить диск выключенной ВМ. При наличии ключа сначала меняет NetBox.",
                "vmctl disk add guest data --size-gb 20")
@@ -204,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
             ("prepare", "Только NetBox; затем правки и sync"),
             ("create", "prepare + sync сразу, без паузы для правок"),
             ("sync", "ВМ по NetBox; --purge: удалить лишние файлы"),
-            ("adopt", "Завести в NetBox отсутствующие локальные ВМ"),
+            ("adopt", "Передать в NetBox одну или все локальные ВМ"),
             ("delete", "Удалить ВМ; --purge удалит и диски"),
         ]),
         ("Компоненты", [
@@ -572,9 +573,13 @@ def audit(config: dict) -> int:
                             print(f"DIFF {name} disks: NetBox and local disk paths differ")
                             problems += 1
                         actual_sizes = {item["path"]: item.get("size_bytes") for item in local["disks"]}
-                        if any(actual_sizes.get(item["path"]) != item["size_gb"] * 1024**3
+                        if any((actual_sizes.get(item["path"]) + 1024**2 - 1) // 1024**2 != item["size_mb"]
+                               if actual_sizes.get(item["path"]) is not None else True
                                for item in spec["disks"]):
                             print(f"DIFF {name} disk sizes: NetBox and local capacities differ")
+                            problems += 1
+                        if context.get("source") == "existing" and context.get("mounted_media", []) != local.get("mounted_media", []):
+                            print(f"DIFF {name} mounted media: NetBox and local CD-ROM sources differ")
                             problems += 1
                         wanted_nics = {(item["bridge"], item["mac_address"].lower()) for item in spec["interfaces"]}
                         actual_nics = {(item["bridge"], (item["mac_address"] or "").lower())
@@ -609,31 +614,37 @@ def audit(config: dict) -> int:
     return 1 if problems else 0
 
 
-def adopt(config: dict, dry_run: bool) -> int:
+def adopt(config: dict, dry_run: bool, name: str | None = None) -> int:
     require_netbox(config)
     device_id, cluster_id = find_device(config)
     records = list_vms(config, device_id)
     remote = {vm["name"]: vm for vm in records}
     if len(remote) != len(records):
         raise NetBoxError("duplicate VM names are assigned to this host device")
-    pending = []
-    for name in local_names(config):
-        existing = remote.get(name)
+    names = local_names(config)
+    if name is not None:
+        if name not in names:
+            raise ValueError(f"local VM {name!r} does not exist")
+        names = [name]
+    for vm_name in names:
+        existing = remote.get(vm_name)
+        if not existing:
+            duplicate = find_vm(config, vm_name, cluster_id)
+            if duplicate:
+                raise NetBoxError(f"VM {vm_name!r} already exists in this cluster on another host")
+        vm = inspect_vm(config, vm_name)
         if existing:
-            print(f"SKIP {name}: already documented on this host (ID {existing['id']})")
-            continue
-        # Also check the cluster, so a name assigned to another host cannot be duplicated.
-        duplicate = find_vm(config, name, cluster_id)
-        if duplicate:
-            raise NetBoxError(f"VM {name!r} already exists in this cluster on another host")
-        pending.append(inspect_vm(config, name))
-    for vm in pending:
-        if dry_run:
-            print(f"WOULD IMPORT {vm['name']}: {vm['vcpus']} vCPU, {vm['memory_mb']} MiB, {vm['disk_mb']} MiB disk")
+            record = get_vm(config, vm_name, cluster_id, device_id)
+            reconcile_adopted_vm(config, record, vm, dry_run)
+        elif dry_run:
+            validate_import_vm(vm)
+            print(f"WOULD IMPORT {vm_name}: {vm['vcpus']} vCPU, {vm['memory_mb']} MiB, "
+                  f"{len(vm['disks'])} disk(s), {len(vm['interfaces'])} interface(s), "
+                  f"{len(vm.get('mounted_media', []))} ISO/media")
         else:
             record = import_vm(config, vm, cluster_id, device_id)
-            print(f"IMPORTED {vm['name']} as NetBox VM {record['id']}")
-    print(f"Adoption: {len(pending)} VM(s) {'would be ' if dry_run else ''}imported")
+            print(f"IMPORTED {vm_name} as NetBox VM {record['id']}")
+    print(f"Adoption: {len(names)} VM(s) processed")
     return 0
 
 
@@ -834,7 +845,7 @@ def main() -> int:
                 return check_vm(config, args.vm) if args.vm else check_host(config)
             if args.command == "audit":
                 return audit(config)
-            return adopt(config, args.dry_run)
+            return adopt(config, args.dry_run, args.vm)
         except (NetBoxError, ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"{args.command} failed: {error}", file=sys.stderr)
             return 1

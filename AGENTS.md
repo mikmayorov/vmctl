@@ -6,4 +6,4 @@
 - After a VM is recorded in NetBox, read its standard VM fields and `local_context_data.vmctl` to construct or reconcile the local VM. TOML input is a request, not an authoritative copy.
 - A local failure must not delete or silently roll back the NetBox record. Report the divergence and keep a retry path.
 - Keep tests that verify NetBox writes precede local mutations and that NetBox failures stop them.
-- Adoption requires an existing NetBox device assigned to a cluster. It creates missing VM records only and never changes local VMs.
+- Adoption requires an existing NetBox device assigned to a cluster. It explicitly imports observed local state into missing or existing NetBox VM records and components; it never changes local VMs or IPAM addresses. Ordinary sync remains NetBox to libvirt.
