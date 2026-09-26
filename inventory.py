@@ -85,7 +85,7 @@ def inspect_vm(config: dict, name: str) -> dict:
     if autostart not in ("enable", "disable"):
         raise ValueError(f"VM {name}: cannot read autostart state")
     return {
-        "name": name, "vcpus": int(vcpu), "memory_mb": memory_mb,
+        "name": name, "uuid": root.findtext("./uuid"), "vcpus": int(vcpu), "memory_mb": memory_mb,
         "disk_mb": (disk_bytes + 1024**2 - 1) // 1024**2,
         "disk_paths": disk_paths,
         "disks": disk_items,
