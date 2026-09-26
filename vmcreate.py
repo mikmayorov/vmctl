@@ -47,6 +47,10 @@ def purge_pending(vm: dict, config: dict, project_dir: Path,
     pending = pending_purge_file(project_dir, vm["name"])
     if not pending.exists():
         return
+    state = subprocess.run(["virsh", "-c", config["host"]["libvirt_uri"], "domstate", vm["name"]],
+                           check=True, capture_output=True, text=True).stdout.strip()
+    if state != "shut off":
+        raise ValueError(f"shut down {vm['name']} before purging its disks")
     paths = json.loads(pending.read_text(encoding="utf-8"))
     if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
         raise ValueError(f"invalid pending purge state: {pending}")
@@ -183,9 +187,10 @@ def domain_xml(vm: dict, disk: Path, bridge: str, seed: Path | None = None) -> s
     return ET.tostring(root, encoding="unicode") + "\n"
 
 
-def verify_local_vm(vm: dict, config: dict) -> None:
+def verify_local_vm(vm: dict, config: dict, live: bool = False) -> None:
     result = subprocess.run(
-        ["virsh", "-c", config["host"]["libvirt_uri"], "dumpxml", "--inactive", "--security-info", vm["name"]],
+        ["virsh", "-c", config["host"]["libvirt_uri"], "dumpxml", *([] if live else ["--inactive"]),
+         "--security-info", vm["name"]],
         check=True, capture_output=True, text=True,
     )
     root = ET.fromstring(result.stdout)
@@ -249,14 +254,17 @@ def verify_local_vm(vm: dict, config: dict) -> None:
         raise ValueError(f"local VM {vm['name']} differs from its NetBox definition")
 
 
-def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge: bool = False) -> None:
-    """Reconcile an offline libvirt definition while preserving unrelated XML devices."""
+def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge: bool = False,
+                stage_running: bool = False) -> None:
+    """Reconcile persistent libvirt XML, optionally staging changes for a running VM."""
     uri = config["host"]["libvirt_uri"]
     name = vm["name"]
     state = subprocess.run(["virsh", "-c", uri, "domstate", name],
                            check=True, capture_output=True, text=True).stdout.strip()
-    if state != "shut off" and not dry_run:
+    if state != "shut off" and not (dry_run or stage_running):
         raise ValueError(f"shut down {name} before changing its libvirt definition")
+    if state != "shut off" and purge and not dry_run:
+        raise ValueError(f"shut down {name} before purging its disks")
     xml_path = project_dir / "state" / "domains" / f"{name}.xml"
     current = subprocess.run(["virsh", "-c", uri, "dumpxml", "--inactive", "--security-info", name],
                              check=True, capture_output=True, text=True).stdout
@@ -374,7 +382,9 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
     if dry_run:
         print(f"WOULD UPDATE local XML for {name} from NetBox")
         if state != "shut off":
-            print(f"REQUIRES SHUTDOWN: {name} is {state}")
+            print(f"NEXT START: {name} is {state}; changes require shutdown and start")
+            if purge:
+                print(f"PURGE REQUIRES SHUTDOWN: {name}")
         for path in sorted(removed_paths):
             print(f"WOULD {'PURGE' if purge else 'KEEP'} detached disk {path}")
         return
@@ -401,7 +411,10 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
     subprocess.run(["virsh", "-c", uri, "define", str(xml_path)], check=True)
     if purge:
         purge_pending(vm, config, project_dir, desired_paths)
-    print(f"Updated local VM definition from NetBox: {name}")
+    if state != "shut off":
+        print(f"Staged persistent XML for {name}; changes require shutdown and start")
+    else:
+        print(f"Updated local VM definition from NetBox: {name}")
 
 
 def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:

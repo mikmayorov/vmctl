@@ -74,8 +74,24 @@ class ComponentTests(unittest.TestCase):
                   contextlib.redirect_stdout(io.StringIO()) as output):
                 redefine_vm(spec, {"host": {"libvirt_uri": "qemu:///system"},
                                    "storage": {"directory": directory}}, Path(directory), True)
-            self.assertIn("REQUIRES SHUTDOWN: guest is running", output.getvalue())
+            self.assertIn("NEXT START: guest is running", output.getvalue())
             self.assertFalse(any("define" in item.args[0] for item in command.call_args_list))
+
+            with (patch("vmcreate.subprocess.run", side_effect=run) as command,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                redefine_vm(spec, {"host": {"libvirt_uri": "qemu:///system"},
+                                   "storage": {"directory": directory}}, Path(directory), False,
+                            stage_running=True)
+            self.assertIn("Staged persistent XML", output.getvalue())
+            self.assertTrue(any("define" in item.args[0] for item in command.call_args_list))
+            self.assertFalse(any("shutdown" in item.args[0] or "start" in item.args[0]
+                                 for item in command.call_args_list))
+
+            with patch("vmcreate.subprocess.run", side_effect=run):
+                with self.assertRaisesRegex(ValueError, "before purging"):
+                    redefine_vm(spec, {"host": {"libvirt_uri": "qemu:///system"},
+                                       "storage": {"directory": directory}}, Path(directory), False,
+                                purge=True, stage_running=True)
 
     def test_redefine_preserves_uuid_and_adds_disk_without_changing_existing_disk(self):
         with tempfile.TemporaryDirectory() as directory:

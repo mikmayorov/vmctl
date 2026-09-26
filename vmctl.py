@@ -132,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
                  "vmctl create local/guest.toml",
                  details="Если нужно назначить IP или изменить дисплей до создания локальной ВМ, используйте prepare, затем правки в NetBox и sync.")
     create.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
-    sync = add("sync", "Применить записи NetBox к одной или всем ВМ этого хоста. Нужен API-ключ; для изменения XML выключите ВМ.",
+    sync = add("sync", "Применить записи NetBox к одной или всем ВМ этого хоста. XML работающей ВМ вступит в силу после выключения и запуска.",
                "vmctl --dry-run sync",
                details="Без имени обработать все ВМ устройства этого хоста; с именем — одну. Ошибка одной ВМ не останавливает остальные. IP в гостевой ОС команда не настраивает.")
     sync.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна ВМ; без имени все ВМ устройства хоста в NetBox")
@@ -946,7 +946,8 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                             "status": desired_status,
                             "changelog_message": "vmctl requested local definition sync",
                         })
-                    redefine_vm(vm, config, Path(__file__).parent, args.dry_run, getattr(args, "purge", False))
+                    redefine_vm(vm, config, Path(__file__).parent, args.dry_run,
+                                getattr(args, "purge", False), stage_running=True)
                     changed = True
                     if not args.dry_run:
                         verify_local_vm(vm, config)
@@ -968,6 +969,11 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                         if power_command:
                             print(f"NetBox: set {vm['name']} status to {desired_status}")
                             print(shlex.join(["virsh", "-c", config["host"]["libvirt_uri"], power_command, vm["name"]]))
+                        if state == "running" and not changed:
+                            try:
+                                verify_local_vm(vm, config, live=True)
+                            except ValueError:
+                                print(f"PENDING RESTART: {vm['name']} needs shutdown and start")
                     return 0
                 if getattr(args, "purge", False) and not changed and pending_purge_file(Path(__file__).parent, vm["name"]).exists():
                     patch_vm(config, record["id"], {
@@ -975,6 +981,15 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                         "changelog_message": "vmctl requested pending disk purge",
                     })
                     purge_pending(vm, config, Path(__file__).parent)
+                state = subprocess.run(
+                    ["virsh", "-c", config["host"]["libvirt_uri"], "domstate", vm["name"]],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                if state == "running":
+                    try:
+                        verify_local_vm(vm, config, live=True)
+                    except ValueError:
+                        print(f"Pending restart for {vm['name']}: shutdown and start to apply persistent XML")
                 if desired_status == "planned":
                     patch_vm(config, record["id"], {"status": "staged"})
                 reconcile_power(config, record, desired_status)

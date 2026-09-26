@@ -526,7 +526,7 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.verify_vm_serial", return_value=None),
             patch("vmctl.verify_local_vm", side_effect=[ValueError("drift"), None]) as verify,
             patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox")),
-            patch("vmctl.redefine_vm", side_effect=lambda *a: order.append("libvirt")) as redefine,
+            patch("vmctl.redefine_vm", side_effect=lambda *a, **kw: order.append("libvirt")) as redefine,
             patch("vmctl.create_vm") as create,
             patch("vmctl.subprocess.run", return_value=SimpleNamespace(stdout="test-vm\n")),
             contextlib.redirect_stdout(io.StringIO()),
