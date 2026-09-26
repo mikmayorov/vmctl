@@ -225,6 +225,7 @@ def verify_local_vm(vm: dict, config: dict) -> None:
             and graphics.get("passwd") == display.get("password"))
     if (
         root.findtext("./name") != vm["name"]
+        or (vm.get("uuid") and root.findtext("./uuid") != vm["uuid"])
         or actual_memory != vm["memory_mb"]
         or root.findtext("./vcpu") != str(vm["vcpus"])
         or not disk_match

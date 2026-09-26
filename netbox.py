@@ -9,10 +9,25 @@ from decimal import Decimal, InvalidOperation
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 
 class NetBoxError(Exception):
     pass
+
+
+def vm_serial_uuid(record: dict) -> str | None:
+    """Read a VM's libvirt UUID from the NetBox Serial field."""
+    serial = record.get("serial")
+    if not serial:
+        return None
+    try:
+        canonical = str(uuid.UUID(serial))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise NetBoxError(f"NetBox VM {record.get('name')!r} Serial is not a UUID") from error
+    if serial != canonical:
+        raise NetBoxError(f"NetBox VM {record.get('name')!r} Serial must be a canonical UUID: {canonical}")
+    return canonical
 
 
 KEY_FILE = Path(__file__).with_name("netbox.key")
@@ -250,12 +265,16 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     if any(item.get("size_bytes", item["size_gb"] * 1024**3) != item["size_gb"] * 1024**3
            for item in local_disks):
         raise NetBoxError(f"VM {vm['name']} has a disk whose size is not a whole GiB")
+    try:
+        serial = str(uuid.UUID(vm["uuid"]))
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise NetBoxError(f"VM {vm['name']} needs a readable libvirt UUID for adoption") from error
     named_disks = [{**item, "name": vm["name"] if index == 0 else f"disk-{index + 1}"}
                    for index, item in enumerate(local_disks)]
     named_interfaces = [{**item, "name": item.get("name") or ("inet" if index == 0 else f"net-{index + 1}")}
                         for index, item in enumerate(local_interfaces)]
     payload = {
-        "name": vm["name"], "cluster": cluster_id, "device": device_id,
+        "name": vm["name"], "serial": serial, "cluster": cluster_id, "device": device_id,
         "status": vm["status"], "vcpus": vm["vcpus"],
         "memory": vm["memory_mb"], "disk": vm["disk_mb"],
         "description": vm.get("description", ""),
@@ -292,6 +311,7 @@ def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
         raise NetBoxError("config needs an absolute storage.directory")
     payload = {
         "name": vm["name"],
+        "serial": str(uuid.uuid4()),
         "cluster": cluster_id,
         "device": device_id,
         "status": "planned",
@@ -350,6 +370,7 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         raise NetBoxError("NetBox VM has no supported vmctl context")
     result = {
         "name": name,
+        "uuid": vm_serial_uuid(record),
         "vcpus": vcpus,
         "memory_mb": memory,
         "disk_gb": disk_mb // 1024,

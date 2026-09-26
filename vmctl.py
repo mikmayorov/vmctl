@@ -11,12 +11,14 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from pathlib import Path
 
 from netbox import (
     NetBoxError, COMPONENT_NAME, _request, add_component, create_vm_components, ensure_primary_mac,
     find_device, find_vm, get_vm, has_netbox_key, import_vm, interface_ips, interface_macs, list_vms,
     local_spec_from_netbox, patch_vm, remove_component, reserve_vm, vm_disks, vm_interfaces,
+    vm_serial_uuid,
 )
 from inventory import inspect_display, inspect_vm, local_names
 from vmcreate import (NAME_RE, create_vm, interface_alias, pending_purge_file, purge_pending,
@@ -78,7 +80,7 @@ def _overview(groups: list[tuple[str, list[tuple[str, str]]]],
                 parts.append(synopsis if (not argument.option_strings and argument.nargs != "?")
                              or argument.required else f"[{synopsis}]")
             synopsis = " ".join(parts)
-            if len(synopsis) <= 34:
+            if len(synopsis) <= 34 and len(synopsis) + len(summary) + 3 <= 80:
                 lines.append(f"  {synopsis:<34} {summary}")
             else:
                 lines.extend((f"  {synopsis}", f"  {'':34} {summary}"))
@@ -136,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("vm", metavar="ИМЯ", help="Имя ВМ на устройстве этого хоста в NetBox")
     sync.add_argument("--purge", action="store_true",
                       help="Удалить файлы управляемых дисков, уже исключённых из записи NetBox")
+    sync.add_argument("--serial-only", action="store_true",
+                      help="Заполнить пустое поле Serial в NetBox UUID существующей локальной ВМ; остальное не менять")
     add("adopt", "Создать в NetBox записи только для отсутствующих локальных ВМ; libvirt не меняется. Нужен API-ключ и существующее устройство хоста.",
         "vmctl --dry-run adopt")
 
@@ -201,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("Виртуальные машины", [
             ("prepare", "Только NetBox; затем правки и sync"),
             ("create", "prepare + sync сразу, без паузы для правок"),
-            ("sync", "Создать/обновить ВМ по NetBox; --purge: файлы"),
+            ("sync", "ВМ по NetBox; --purge: файлы, --serial-only: UUID"),
             ("adopt", "Завести в NetBox отсутствующие локальные ВМ"),
             ("delete", "Удалить ВМ; --purge удалит и диски"),
         ]),
@@ -229,6 +233,45 @@ def parse_args() -> argparse.Namespace:
 def require_netbox(config: dict) -> None:
     if not has_netbox_key(config):
         raise NetBoxError("NetBox key is absent; this host runs in local-only mode")
+
+
+def local_uuid(config: dict, name: str) -> str:
+    value = subprocess.run(["virsh", "-c", config["host"]["libvirt_uri"], "domuuid", name],
+                           check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        canonical = str(uuid.UUID(value))
+    except ValueError as error:
+        raise ValueError(f"libvirt VM {name!r} returned an invalid UUID: {value!r}") from error
+    return canonical
+
+
+def sync_vm_serial(config: dict, record: dict, local_exists: bool,
+                   dry_run: bool, serial_only: bool = False) -> dict:
+    """Backfill a missing NetBox Serial before any local VM mutation."""
+    saved = vm_serial_uuid(record)
+    actual = local_uuid(config, record["name"]) if local_exists else None
+    if saved and actual and saved != actual:
+        raise NetBoxError(f"VM {record['name']}: NetBox Serial {saved} differs from libvirt UUID {actual}")
+    if saved:
+        if serial_only:
+            print(f"NetBox Serial already matches libvirt: {record['name']} ({saved})")
+        return record
+    if serial_only and not actual:
+        raise NetBoxError(f"VM {record['name']} has no local UUID to copy into NetBox Serial")
+    serial = actual or str(uuid.uuid4())
+    if dry_run:
+        print(f"NetBox: set Serial of {record['name']} to {serial}")
+        return {**record, "serial": serial}
+    patch_vm(config, record["id"], {
+        "serial": serial,
+        "changelog_message": "vmctl recorded libvirt UUID in VM Serial",
+    })
+    device_id, cluster_id = find_device(config)
+    updated = get_vm(config, record["name"], cluster_id, device_id)
+    if vm_serial_uuid(updated) != serial:
+        raise NetBoxError(f"VM {record['name']}: NetBox did not retain Serial {serial}")
+    print(f"NetBox Serial: {record['name']} = {serial}")
+    return updated
 
 
 def show_list(config: dict) -> int:
@@ -513,6 +556,17 @@ def audit(config: dict) -> int:
         try:
             local = inspect_vm(config, name)
             vm = remote[name]
+            try:
+                serial = vm_serial_uuid(vm)
+                if not serial:
+                    print(f"MISSING SERIAL {name}: NetBox VM has no libvirt UUID")
+                    problems += 1
+                elif local.get("uuid") != serial:
+                    print(f"DIFF {name} uuid: NetBox Serial={serial} local={local.get('uuid')!r}")
+                    problems += 1
+            except NetBoxError as error:
+                print(f"INVALID {name}: {error}")
+                problems += 1
             status = vm.get("status")
             status = status.get("value") if isinstance(status, dict) else status
             start = vm.get("start_on_boot")
@@ -698,6 +752,7 @@ def check_vm(config: dict, name: str) -> int:
                 status = record.get("status")
                 status = status.get("value") if isinstance(status, dict) else status
                 print(f"NetBox: статус {status or '-'}")
+                print(f"NetBox Serial: {record.get('serial') or '-'}")
                 for family in ("4", "6"):
                     ip = record.get(f"primary_ip{family}")
                     print(f"Primary IPv{family}: {ip.get('address', '-') if isinstance(ip, dict) else '-'}")
@@ -871,6 +926,11 @@ def main() -> int:
                 require_netbox(config)
                 device_id, cluster_id = find_device(config)
                 record = get_vm(config, args.vm, cluster_id, device_id)
+                if getattr(args, "serial_only", False):
+                    if args.purge:
+                        raise ValueError("--serial-only cannot be combined with --purge")
+                    sync_vm_serial(config, record, args.vm in local_names(config), args.dry_run, True)
+                    return 0
                 context = (record.get("local_context_data") or {}).get("vmctl") or {}
                 if context.get("delete_requested"):
                     raise NetBoxError("VM deletion is pending; retry vmctl delete instead of sync")
@@ -890,6 +950,9 @@ def main() -> int:
                     raise NetBoxError("adopted VM is missing locally; restore it before sync")
             else:
                 vm = validate_spec({"vm": vm})
+            if args.command == "sync":
+                record = sync_vm_serial(config, record, vm["name"] in local_names(config), args.dry_run)
+                vm["uuid"] = vm_serial_uuid(record)
             desired_status = record.get("status")
             if isinstance(desired_status, dict):
                 desired_status = desired_status.get("value")

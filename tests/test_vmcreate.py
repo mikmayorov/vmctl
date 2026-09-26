@@ -3,6 +3,7 @@ import io
 import subprocess
 import tempfile
 import unittest
+import uuid
 import xml.etree.ElementTree as ET
 from argparse import Namespace
 from pathlib import Path
@@ -181,11 +182,13 @@ class NetBoxTests(unittest.TestCase):
         config = {
             "storage": {"directory": "/images"}, "network": {"bridge": "br1"},
         }
-        with patch("netbox._request", side_effect=[{"results": []}, {"id": 42}]) as request:
+        serial = "00000000-0000-4000-8000-000000000001"
+        with patch("netbox.uuid.uuid4", return_value=uuid.UUID(serial)), \
+             patch("netbox._request", side_effect=[{"results": []}, {"id": 42}]) as request:
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(netbox.reserve_vm(config, vm, 7, 12)["id"], 42)
         self.assertEqual(request.call_args_list[1].args[3], {
-            "name": "test-vm", "cluster": 7, "device": 12, "status": "planned", "start_on_boot": "off",
+            "name": "test-vm", "serial": serial, "cluster": 7, "device": 12, "status": "planned", "start_on_boot": "off",
             "vcpus": 2, "memory": 2048, "disk": 20480, "description": "",
             "local_context_data": {"vmctl": {
                 "version": 3, "source": "iso", "iso": "/images/installer.iso",
@@ -198,6 +201,7 @@ class NetBoxTests(unittest.TestCase):
     def test_local_sizing_and_install_source_come_from_netbox(self):
         record = {
             "name": "test-vm", "vcpus": "4.00", "memory": 4096, "disk": 32768,
+            "serial": "00000000-0000-4000-8000-000000000002",
             "local_context_data": {"vmctl": {
                 "version": 1, "source": "iso", "iso": "/images/install.iso",
                 "bridge": "br1", "storage_directory": "/images",
@@ -206,6 +210,7 @@ class NetBoxTests(unittest.TestCase):
         vm = netbox.local_spec_from_netbox(record)
         self.assertEqual((vm["vcpus"], vm["memory_mb"], vm["disk_gb"]), (4, 4096, 32))
         self.assertEqual(vm["iso"], "/images/install.iso")
+        self.assertEqual(vm["uuid"], record["serial"])
 
     def test_new_vm_reads_disk_mac_and_primary_ips_from_netbox(self):
         record = {
@@ -342,10 +347,12 @@ class OperationOrderTests(unittest.TestCase):
 
     def test_audit_compares_standard_fields_without_vmctl_context(self):
         config = {"netbox": {"key": "secret"}}
-        remote = {"name": "old", "vcpus": 2, "memory": 2048, "disk": 10240,
+        remote = {"name": "old", "serial": "00000000-0000-4000-8000-000000000001",
+                  "vcpus": 2, "memory": 2048, "disk": 10240,
                   "status": {"value": "active"}, "start_on_boot": {"value": "on"}}
         local = {"vcpus": 4, "memory_mb": 4096, "disk_mb": 20480,
-                 "status": "active", "autostart": True}
+                 "status": "active", "autostart": True,
+                 "uuid": "00000000-0000-4000-8000-000000000002"}
         with (
             patch("vmctl.find_device", return_value=(12, 7)),
             patch("vmctl.list_vms", return_value=[remote]),
@@ -356,6 +363,7 @@ class OperationOrderTests(unittest.TestCase):
             self.assertEqual(vmctl.audit(config), 1)
         report = output.getvalue()
         self.assertIn("INVALID old: NetBox VM has no supported vmctl context", report)
+        self.assertIn("DIFF old uuid:", report)
         self.assertIn("DIFF old vcpus:", report)
         self.assertIn("DIFF old memory_mb:", report)
         self.assertIn("DIFF old disk_mb:", report)
@@ -439,6 +447,7 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.get_vm", return_value={"id": 42, "status": {"value": "planned"}}),
             patch("vmctl.vm_interfaces", return_value=[]),
             patch("vmctl.local_spec_from_netbox", return_value=local_spec),
+            patch("vmctl.sync_vm_serial", side_effect=lambda _config, record, *args: record),
             patch("vmctl.subprocess.run", return_value=SimpleNamespace(stdout="", returncode=0)),
             patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox")),
             patch("vmctl.create_vm", side_effect=lambda *a: order.append("local")),
@@ -464,6 +473,7 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.get_vm", return_value=record),
             patch("vmctl.vm_interfaces", return_value=[]),
             patch("vmctl.local_spec_from_netbox", return_value=plan),
+            patch("vmctl.sync_vm_serial", side_effect=lambda _config, record, *args: record),
             patch("vmctl.verify_local_vm") as verify,
             patch("vmctl.create_vm") as create,
             patch("vmctl.subprocess.run", side_effect=local),
@@ -490,6 +500,7 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.get_vm", return_value=record),
             patch("vmctl.vm_interfaces", return_value=[]),
             patch("vmctl.local_spec_from_netbox", return_value=plan),
+            patch("vmctl.sync_vm_serial", side_effect=lambda _config, record, *args: record),
             patch("vmctl.verify_local_vm", side_effect=[ValueError("drift"), None]) as verify,
             patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox")),
             patch("vmctl.redefine_vm", side_effect=lambda *a: order.append("libvirt")) as redefine,
