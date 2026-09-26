@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage libvirt VMs on the local host."""
+"""Управление виртуальными машинами libvirt/KVM на текущем хосте."""
 
 import argparse
 import json
@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -48,63 +49,171 @@ def load_config(path: Path) -> dict:
     return config
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--dry-run", action="store_true", help="print command without executing it")
-    commands = parser.add_subparsers(dest="command", required=True)
-    create = commands.add_parser("create", help="define a new VM from ISO or cloud image")
-    create.add_argument("spec", type=Path, help="TOML VM specification")
-    prepare = commands.add_parser("prepare", help="create VM, disk and interface in NetBox before local provisioning")
-    prepare.add_argument("spec", type=Path, help="TOML VM specification")
-    sync = commands.add_parser("sync", help="apply a VM definition from NetBox locally")
-    sync.add_argument("vm", help="VM name in NetBox")
-    sync.add_argument("--purge", action="store_true", help="delete detached managed disk files")
-    disk = commands.add_parser("disk", help="add or remove a virtual disk")
-    disk_actions = disk.add_subparsers(dest="action", required=True)
-    disk_add = disk_actions.add_parser("add")
-    disk_add.add_argument("vm")
-    disk_add.add_argument("name")
-    disk_add.add_argument("--size-gb", type=int, required=True)
-    disk_remove = disk_actions.add_parser("remove")
-    disk_remove.add_argument("vm")
-    disk_remove.add_argument("name")
-    disk_remove.add_argument("--purge", action="store_true")
-    nic = commands.add_parser("nic", help="add or remove a virtual interface")
-    nic_actions = nic.add_subparsers(dest="action", required=True)
-    nic_add = nic_actions.add_parser("add")
-    nic_add.add_argument("vm")
-    nic_add.add_argument("name")
-    nic_add.add_argument("--bridge")
-    nic_add.add_argument("--mac")
-    nic_remove = nic_actions.add_parser("remove")
-    nic_remove.add_argument("vm")
-    nic_remove.add_argument("name")
-    delete = commands.add_parser("delete", help="delete a stopped VM")
-    delete.add_argument("vm")
-    delete.add_argument("--purge", action="store_true")
-    commands.add_parser("doctor", help="check local tools and NetBox host configuration")
-    commands.add_parser("audit", help="compare local VM inventory with NetBox")
-    commands.add_parser("adopt", help="register undocumented local VMs in NetBox")
-    for name, help_text in (
-        ("check", "show libvirt version"),
-        ("list", "list all VMs"),
-        ("pools", "list storage pools"),
-        ("networks", "list libvirt networks"),
-        ("info", "show VM details"),
-        ("status", "show VM state"),
-        ("start", "start a VM"),
-        ("shutdown", "request a graceful VM shutdown"),
-        ("reboot", "request a graceful VM reboot"),
-        ("console", "open the VM serial console"),
-        ("vnc", "show the VM VNC display"),
-        ("autostart", "enable VM autostart"),
-        ("autostart-off", "disable VM autostart"),
+def _help_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-h", "--help", action="help", help="Показать эту справку и выйти")
+    parser._optionals.title = "Параметры"
+    parser._positionals.title = "Аргументы"
+
+
+def _overview(groups: list[tuple[str, list[str]]], parsers: dict[str, argparse.ArgumentParser]) -> str:
+    listed = [name for _, names in groups for name in names]
+    leaves = {name for name, parser in parsers.items()
+              if not any(isinstance(action, argparse._SubParsersAction) for action in parser._actions)}
+    if len(listed) != len(leaves) or set(listed) != leaves:
+        raise ValueError("every vmctl command must appear exactly once in the help overview")
+    lines = []
+    for title, names in groups:
+        lines.extend((title + ":", ""))
+        for name in names:
+            command = parsers[name]
+            parts = [command.prog]
+            arguments = []
+            for argument in command._actions:
+                if argument.dest == "help":
+                    continue
+                label = ", ".join(argument.option_strings) if argument.option_strings else argument.metavar or argument.dest
+                if argument.option_strings and argument.nargs != 0:
+                    label += " " + (argument.metavar or argument.dest.upper())
+                synopsis = label.split(", ")[-1]
+                parts.append(synopsis if not argument.option_strings or argument.required else f"[{synopsis}]")
+                arguments.append((label, argument.help))
+            lines.append("  " + " ".join(parts))
+            lines.extend(textwrap.wrap(command.description, width=88,
+                                       initial_indent="      ", subsequent_indent="      "))
+            for label, explanation in arguments:
+                lines.extend(textwrap.wrap(f"{label}: {explanation}", width=88,
+                                           initial_indent="      ", subsequent_indent="      "))
+            lines.append("")
+    lines.extend((
+        "Общие параметры ставьте перед командой: vmctl --dry-run sync ИМЯ.",
+        "NetBox хранит требуемое состояние при наличии API-ключа; изменения сначала",
+        "записываются в NetBox, затем применяются к libvirt. IP назначают в NetBox IPAM.",
+        "Подробности и примеры: vmctl КОМАНДА -h, vmctl disk add -h.",
+    ))
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="vmctl", add_help=False, description=__doc__,
+        usage="vmctl [-h] [--config ФАЙЛ] [--dry-run] КОМАНДА [АРГУМЕНТЫ]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _help_argument(parser)
+    parser._optionals.title = "Общие параметры"
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, metavar="ФАЙЛ",
+                        help="Путь к конфигурации хоста (по умолчанию: %(default)s)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Показать план без записи в NetBox и без локальных изменений")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="КОМАНДА", help=argparse.SUPPRESS)
+    parsers = {}
+
+    def add(name: str, description: str, example: str | None = None, parent=commands,
+            details: str | None = None) -> argparse.ArgumentParser:
+        epilog = "\n\n".join(part for part in (details, f"Пример:\n  {example}" if example else None) if part)
+        command = parent.add_parser(name, add_help=False, help=description, description=description,
+                                    formatter_class=argparse.RawDescriptionHelpFormatter,
+                                    epilog=epilog or None)
+        _help_argument(command)
+        parsers[command.prog.removeprefix("vmctl ")] = command
+        return command
+
+    add("doctor", "Проверить virsh, qemu-img, libvirt, хранилище, мост и, при наличии ключа, доступ к NetBox.",
+        "vmctl doctor")
+    add("audit", "Сверить все локальные ВМ с NetBox; вывести расхождения, ничего не меняя. Нужен API-ключ.",
+        "vmctl audit")
+    add("check", "Показать версию локального libvirt.", "vmctl check")
+    add("list", "Показать все локальные ВМ и их состояния.", "vmctl list")
+    add("pools", "Показать пулы хранения libvirt.", "vmctl pools")
+    add("networks", "Показать сети libvirt.", "vmctl networks")
+    for name, description in (
+        ("info", "Показать параметры локальной ВМ из libvirt."),
+        ("status", "Показать текущее состояние локальной ВМ."),
     ):
-        command = commands.add_parser(name, help=help_text)
-        if name in ("info", "status", "start", "shutdown", "reboot", "console", "vnc", "autostart", "autostart-off"):
-            command.add_argument("vm", help="VM name")
-    return parser.parse_args()
+        add(name, description, f"vmctl {name} guest").add_argument("vm", metavar="ИМЯ",
+                                                                   help="Имя локальной ВМ")
+
+    prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Нужен API-ключ; libvirt не меняется.",
+                  "vmctl prepare local/guest.toml",
+                  details="После подготовки назначьте IP и дисплей в NetBox, затем выполните vmctl sync ИМЯ.")
+    prepare.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
+    create = add("create", "Создать ВМ из ISO или cloud image: сначала запись в NetBox, затем локальную ВМ. Без ключа работает только локально; ВМ не запускает.",
+                 "vmctl create local/guest.toml")
+    create.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
+    sync = add("sync", "Применить требуемое состояние ВМ из NetBox к libvirt. Нужен API-ключ; для изменения XML выключите ВМ.",
+               "vmctl --dry-run sync guest",
+               details="Сначала проверьте план через vmctl --dry-run sync ИМЯ. IP в гостевой ОС команда не настраивает.")
+    sync.add_argument("vm", metavar="ИМЯ", help="Имя ВМ на устройстве этого хоста в NetBox")
+    sync.add_argument("--purge", action="store_true",
+                      help="Удалить файлы управляемых дисков, уже исключённых из записи NetBox")
+    add("adopt", "Создать в NetBox записи только для отсутствующих локальных ВМ; libvirt не меняется. Нужен API-ключ и существующее устройство хоста.",
+        "vmctl --dry-run adopt")
+
+    disk = add("disk", "Добавить или удалить диск выключенной ВМ. При наличии ключа сначала меняет NetBox.",
+               "vmctl disk add guest data --size-gb 20")
+    disk_actions = disk.add_subparsers(dest="action", required=True, title="Действия", metavar="{add,remove}")
+    disk_add = add("add", "Добавить виртуальный диск указанного размера к выключенной ВМ.",
+                   "vmctl disk add guest data --size-gb 20", disk_actions)
+    disk_add.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
+    disk_add.add_argument("name", metavar="ДИСК", help="Имя нового диска в NetBox и vmctl")
+    disk_add.add_argument("--size-gb", type=int, required=True, metavar="ГиБ",
+                          help="Положительный целый размер нового диска в ГиБ")
+    disk_remove = add("remove", "Отключить дополнительный диск выключенной ВМ; загрузочный и последний диск удалить нельзя.",
+                      "vmctl disk remove guest data --purge", disk_actions,
+                      details="Без --purge файл диска сохраняется. С --purge удаляется только управляемый файл.")
+    disk_remove.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
+    disk_remove.add_argument("name", metavar="ДИСК", help="Имя существующего дополнительного диска")
+    disk_remove.add_argument("--purge", action="store_true",
+                             help="Также удалить файл управляемого диска; без флага файл останется")
+
+    nic = add("nic", "Добавить или удалить интерфейс выключенной ВМ. IP-адреса назначают вручную в NetBox IPAM.",
+              "vmctl nic add guest backup --bridge br1")
+    nic_actions = nic.add_subparsers(dest="action", required=True, title="Действия", metavar="{add,remove}")
+    nic_add = add("add", "Добавить интерфейс и primary MAC к выключенной ВМ.",
+                  "vmctl nic add guest backup --bridge br1", nic_actions)
+    nic_add.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
+    nic_add.add_argument("name", metavar="ИНТЕРФЕЙС", help="Имя нового интерфейса в NetBox")
+    nic_add.add_argument("--bridge", metavar="МОСТ",
+                         help="Существующий мост хоста; без флага берётся мост ВМ или хоста")
+    nic_add.add_argument("--mac", metavar="MAC",
+                         help="MAC вида 52:54:00:12:34:56; без флага создаётся автоматически")
+    nic_remove = add("remove", "Удалить интерфейс и его MAC у выключенной ВМ; сначала снимите IP в NetBox IPAM.",
+                     "vmctl nic remove guest backup", nic_actions,
+                     details="При назначенном интерфейсу IP-адресе в NetBox команда остановится до изменений.")
+    nic_remove.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
+    nic_remove.add_argument("name", metavar="ИНТЕРФЕЙС", help="Имя существующего интерфейса")
+
+    delete = add("delete", "Удалить выключенную ВМ из libvirt и, при наличии ключа, из NetBox. IP с интерфейсов нужно снять заранее; файлы дисков по умолчанию остаются.",
+                 "vmctl --dry-run delete guest --purge",
+                 details="Проверьте план через --dry-run. После частичной ошибки повторите delete с тем же выбором --purge.")
+    delete.add_argument("vm", metavar="ИМЯ", help="Имя выключенной ВМ")
+    delete.add_argument("--purge", action="store_true",
+                        help="Удалить также управляемые файлы дисков; без флага сохранить их")
+
+    for name, description in (
+        ("start", "Запросить запуск ВМ; при наличии ключа сначала установить статус active в NetBox."),
+        ("shutdown", "Запросить штатное выключение ВМ; при наличии ключа сначала установить статус offline в NetBox. Дождитесь остановки гостя."),
+        ("reboot", "Запросить штатную перезагрузку работающей ВМ."),
+        ("autostart", "Включить автоматический запуск ВМ вместе с хостом."),
+        ("autostart-off", "Выключить автоматический запуск ВМ вместе с хостом."),
+        ("console", "Открыть последовательную консоль ВМ в текущем терминале."),
+        ("vnc", "Показать обозначение VNC-дисплея ВМ из libvirt."),
+    ):
+        add(name, description, f"vmctl {name} guest").add_argument("vm", metavar="ИМЯ",
+                                                                   help="Имя локальной ВМ")
+
+    parser.epilog = _overview([
+        ("Проверка и просмотр", ["doctor", "audit", "check", "list", "info", "status", "pools", "networks"]),
+        ("Создание и учёт в NetBox", ["prepare", "create", "sync", "adopt"]),
+        ("Диски, интерфейсы и удаление", ["disk add", "disk remove", "nic add", "nic remove", "delete"]),
+        ("Питание и автозапуск", ["start", "shutdown", "reboot", "autostart", "autostart-off"]),
+        ("Доступ к ВМ", ["console", "vnc"]),
+    ], parsers)
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def require_netbox(config: dict) -> None:
