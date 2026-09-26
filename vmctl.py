@@ -189,7 +189,6 @@ def build_parser() -> argparse.ArgumentParser:
         ("reboot", "Запросить штатную перезагрузку работающей ВМ."),
         ("autostart", "Включить автоматический запуск ВМ вместе с хостом."),
         ("autostart-off", "Выключить автоматический запуск ВМ вместе с хостом."),
-        ("console", "Подключиться к serial-порту ВМ; для приглашения входа гостевая ОС должна обслуживать этот порт. Выход: Ctrl+]."),
     ):
         add(name, description, f"vmctl {name} guest").add_argument("vm", metavar="ИМЯ",
                                                                    help="Имя локальной ВМ")
@@ -199,7 +198,6 @@ def build_parser() -> argparse.ArgumentParser:
         ("Создание и учёт в NetBox", ["prepare", "create", "sync", "adopt"]),
         ("Диски, интерфейсы и удаление", ["disk add", "disk remove", "nic add", "nic remove", "delete"]),
         ("Питание и автозапуск", ["start", "shutdown", "reboot", "autostart", "autostart-off"]),
-        ("Доступ к ВМ", ["console"]),
     ], parsers)
     return parser
 
@@ -897,7 +895,6 @@ def main() -> int:
         "start": ["start", getattr(args, "vm", "")],
         "shutdown": ["shutdown", getattr(args, "vm", "")],
         "reboot": ["reboot", getattr(args, "vm", "")],
-        "console": ["console", getattr(args, "vm", "")],
         "autostart": ["autostart", getattr(args, "vm", "")],
         "autostart-off": ["autostart", "--disable", getattr(args, "vm", "")],
     }[args.command]
@@ -914,10 +911,6 @@ def main() -> int:
             print(f"NetBox: update {args.vm}: {netbox_changes}")
         print(shlex.join(command))
         return 0
-    if args.command == "console":
-        print(f"Открываю serial-консоль {args.vm} (не графический экран). Если после Enter пусто, "
-              f"настройте serial-вход внутри гостя; графический дисплей: vmctl check {args.vm}. "
-              "Выход: Ctrl+].", file=sys.stderr, flush=True)
     if netbox_changes and has_netbox_key(config):
         try:
             device_id, cluster_id = find_device(config)
