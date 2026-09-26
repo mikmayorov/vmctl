@@ -391,6 +391,36 @@ class OperationOrderTests(unittest.TestCase):
         self.assertIn("DIFF old memory_mb:", report)
         self.assertIn("DIFF old disk_mb:", report)
 
+    def test_audit_reports_staged_live_difference_as_pending_restart(self):
+        config = {"netbox": {"key": "secret"}}
+        serial = "00000000-0000-4000-8000-000000000001"
+        remote = {"name": "guest", "serial": serial, "vcpus": 2, "memory": 2048,
+                  "disk": 10240, "status": {"value": "active"}, "start_on_boot": {"value": "on"},
+                  "local_context_data": {"vmctl": {"version": 3, "source": "existing"}}}
+        desired_display = {"type": "vnc", "listen": "127.0.0.1", "port": 5901}
+        spec = {"name": "guest", "description": "new", "display": desired_display,
+                "disks": [{"path": "/disk.qcow2", "size_mb": 10240}],
+                "interfaces": [{"bridge": "br0", "mac_address": "52:54:00:00:00:01"}]}
+        local = {"uuid": serial, "vcpus": 2, "memory_mb": 2048, "disk_mb": 10240,
+                 "autostart": True, "status": "active", "description": "old",
+                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": 5900},
+                 "disk_paths": ["/disk.qcow2"],
+                 "disks": [{"path": "/disk.qcow2", "size_bytes": 10240 * 1024**2}],
+                 "mounted_media": [], "interfaces": [{"bridge": "br0", "mac_address": "52:54:00:00:00:01"}]}
+        with (
+            patch("vmctl.find_device", return_value=(12, 7)),
+            patch("vmctl.list_vms", return_value=[remote]),
+            patch("vmctl.local_names", return_value=["guest"]),
+            patch("vmctl.inspect_vm", return_value=local),
+            patch("vmctl.local_spec_from_netbox", return_value=spec),
+            patch("vmctl.verify_local_vm", side_effect=[None, ValueError("live differs")]) as verify,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(vmctl.audit(config), 0)
+        self.assertEqual(verify.call_count, 2)
+        self.assertIn("PENDING RESTART guest", output.getvalue())
+        self.assertIn("0 issue(s)", output.getvalue())
+
     def test_reconcile_power_writes_netbox_before_start(self):
         order = []
         config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}

@@ -579,6 +579,7 @@ def audit(config: dict) -> int:
                 expected["status"] = status
             context = (vm.get("local_context_data") or {}).get("vmctl") or {}
             supported_context = context.get("version") in (1, 2, 3) and context.get("source") in ("iso", "cloud_image", "existing")
+            pending_restart = False
             if not supported_context:
                 print(f"INVALID {name}: NetBox VM has no supported vmctl context")
                 problems += 1
@@ -588,11 +589,21 @@ def audit(config: dict) -> int:
                         spec = local_spec_from_netbox(vm, config)
                         expected.update({field: spec[field] for field in ("description", "display")})
                         expected["disk_mb"] = sum(item["size_mb"] for item in spec["disks"])
-                        if {item["path"] for item in spec["disks"]} != set(local["disk_paths"]):
+                        if local["status"] == "active":
+                            try:
+                                verify_local_vm(spec, config)
+                                try:
+                                    verify_local_vm(spec, config, live=True)
+                                except ValueError:
+                                    pending_restart = True
+                                    print(f"PENDING RESTART {name}: persistent XML matches NetBox; live VM awaits shutdown and start")
+                            except ValueError:
+                                pass
+                        if not pending_restart and {item["path"] for item in spec["disks"]} != set(local["disk_paths"]):
                             print(f"DIFF {name} disks: NetBox and local disk paths differ")
                             problems += 1
                         actual_sizes = {item["path"]: item.get("size_bytes") for item in local["disks"]}
-                        if any((actual_sizes.get(item["path"]) + 1024**2 - 1) // 1024**2 != item["size_mb"]
+                        if not pending_restart and any((actual_sizes.get(item["path"]) + 1024**2 - 1) // 1024**2 != item["size_mb"]
                                if actual_sizes.get(item["path"]) is not None else True
                                for item in spec["disks"]):
                             print(f"DIFF {name} disk sizes: NetBox and local capacities differ")
@@ -601,13 +612,13 @@ def audit(config: dict) -> int:
                                         for item in spec.get("mounted_media", [])]
                         observed_media = [{key: item[key] for key in ("path", "target", "size_mb") if key in item}
                                           for item in local.get("mounted_media", [])]
-                        if context.get("source") != "cloud_image" and wanted_media != observed_media:
+                        if not pending_restart and context.get("source") != "cloud_image" and wanted_media != observed_media:
                             print(f"DIFF {name} mounted media: NetBox and local CD-ROM sources differ")
                             problems += 1
                         wanted_nics = {(item["bridge"], item["mac_address"].lower()) for item in spec["interfaces"]}
                         actual_nics = {(item["bridge"], (item["mac_address"] or "").lower())
                                        for item in local["interfaces"]}
-                        if wanted_nics != actual_nics or len(spec["interfaces"]) != len(local["interfaces"]):
+                        if not pending_restart and (wanted_nics != actual_nics or len(spec["interfaces"]) != len(local["interfaces"])):
                             print(f"DIFF {name} interfaces: NetBox and local interfaces differ")
                             problems += 1
                     except NetBoxError as error:
@@ -625,6 +636,8 @@ def audit(config: dict) -> int:
             for field, wanted in expected.items():
                 observed = local[field].lower() if field == "mac_address" and local[field] else local[field]
                 if observed != wanted:
+                    if pending_restart and field in ("vcpus", "memory_mb", "disk_mb", "description", "display", "bridge", "mac_address", "disk_paths"):
+                        continue
                     if field == "display":
                         print(f"DIFF {name} display: NetBox and local XML differ (password redacted)")
                     else:
