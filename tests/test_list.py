@@ -35,7 +35,7 @@ class ListTests(unittest.TestCase):
                          "192.0.2.5/24", "2001:db8::5/64", "vnc://192.0.2.10:5901", VM["uuid"]):
             self.assertIn(expected, table)
         data = table.splitlines()[1].split()
-        self.assertEqual(data[3:5], ["2.147", "21.475"])
+        self.assertEqual(data[3:5], ["2.148", "21.475"])
         self.assertLess(data.index("vnet11"), data.index("192.0.2.5/24"))
         self.assertEqual(data[-1], VM["uuid"])
 
@@ -65,6 +65,18 @@ class ListTests(unittest.TestCase):
             self.assertEqual(show_list(CONFIG), 0)
         columns = output.getvalue().splitlines()[1].split()
         self.assertEqual(columns[3:5], ["1.612", "1.075"])
+
+    def test_resource_sizes_always_round_up(self):
+        vm = {**VM, "memory_mb": 1, "disks": [{"size_bytes": 1}]}
+        with (patch("vmctl.local_names", return_value=["guest"]),
+              patch("vmctl.inspect_vm", return_value=vm),
+              patch("vmctl.inspect_display", return_value={"type": "none"}),
+              patch("vmctl.has_netbox_key", return_value=False),
+              patch("vmctl.refresh_guest_links"),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(show_list(CONFIG), 0)
+        columns = output.getvalue().splitlines()[1].split()
+        self.assertEqual(columns[3:5], ["0.002", "0.001"])
 
     def test_current_guest_links_follow_persistent_libvirt_xml(self):
         with tempfile.TemporaryDirectory() as directory:

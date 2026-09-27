@@ -172,6 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
     add("audit", "Сверить все локальные ВМ с NetBox; вывести расхождения, ничего не меняя. Нужен API-ключ.",
         "vmctl audit")
     add("list", "Показать таблицу ВМ: состояние, CPU, RAM и диск в десятичных GB, host-интерфейсы, IP, URL дисплея и UUID.", "vmctl list")
+    cat_cmd = add("cat", "Вывести полный постоянный XML ВМ; --live показывает конфигурацию работающей ВМ.",
+                  "vmctl cat guest", details="Постоянный XML действует при следующем запуске. Вывод может содержать пароль дисплея.")
+    cat_cmd.add_argument("vm", metavar="ИМЯ", help="Имя локальной ВМ")
+    cat_cmd.add_argument("--live", action="store_true", help="Показать текущий XML работающей ВМ вместо постоянного")
 
     prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
                   "vmctl prepare local/guest.toml",
@@ -247,6 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.epilog = _overview([
         ("Просмотр", [
             ("list", "ВМ: питание, ресурсы, IP, дисплей"),
+            ("cat", "Полный XML одной ВМ; --live: работающая"),
             ("check", "Проверить хост или показать подробности ВМ"),
             ("audit", "Сверить ВМ с NetBox"),
         ]),
@@ -318,6 +323,18 @@ def display_url(display: dict) -> str:
     return f"{kind.upper()} {host} (порт при запуске)"
 
 
+def cat_vm(config: dict, name: str, live: bool = False) -> int:
+    if not NAME_RE.fullmatch(name):
+        raise ValueError(f"invalid VM name: {name!r}")
+    command = ["virsh", "-c", config["host"]["libvirt_uri"], "dumpxml"]
+    if not live:
+        command.append("--inactive")
+    command.extend(("--security-info", name))
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    sys.stdout.write(result.stdout)
+    return 0
+
+
 def show_list(config: dict) -> int:
     """Show local domains with NetBox primary addresses when available."""
     names = local_names(config)
@@ -341,8 +358,9 @@ def show_list(config: dict) -> int:
             vm = inspect_vm(config, name)
             display = inspect_display(config, name)
             def gb_text(size_bytes: int) -> str:
-                gb = size_bytes / 1_000_000_000
-                return f"{gb:.3f}".rstrip("0").rstrip(".") if gb else "0"
+                milli_gb = (size_bytes + 999_999) // 1_000_000
+                whole, fraction = divmod(milli_gb, 1000)
+                return f"{whole}.{fraction:03d}".rstrip("0").rstrip(".")
             record = records.get(name, {})
 
             def primary_ip(family: str) -> str:
@@ -1146,6 +1164,14 @@ def main() -> int:
             return show_list(config)
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"list failed: {error}", file=sys.stderr)
+            return 1
+
+    if args.command == "cat":
+        try:
+            return cat_vm(config, args.vm, args.live)
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+            print(f"cat failed: {detail}", file=sys.stderr)
             return 1
 
     if args.command == "shutdown":
