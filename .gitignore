@@ -4,6 +4,7 @@ __pycache__/
 config.toml
 netbox.key
 state/
+current-guest/
 local/
 *.log
 *.qcow2

@@ -28,6 +28,52 @@ from vmcreate import (NAME_RE, create_vm, interface_alias, pending_purge_file, p
 DEFAULT_CONFIG = Path(__file__).with_name("config.toml")
 
 
+def refresh_guest_links(config: dict, names: list[str] | None = None,
+                        project_dir: Path | None = None) -> int:
+    """Point current-guest entries at libvirt's persistent domain XML files."""
+    project_dir = project_dir or Path(__file__).parent
+    host = config["host"]
+    if host["libvirt_uri"] != "qemu:///system" and "domain_xml_directory" not in host:
+        return 0
+    xml_dir = Path(host.get("domain_xml_directory", "/etc/libvirt/qemu"))
+    if not xml_dir.is_dir():
+        print(f"current-guest: каталог XML libvirt не найден: {xml_dir}", file=sys.stderr)
+        return 1
+    if names is None:
+        names = local_names(config)
+    links_dir = project_dir / "current-guest"
+    errors = 0
+    try:
+        if links_dir.is_symlink():
+            raise ValueError(f"current-guest directory cannot be a symlink: {links_dir}")
+        links_dir.mkdir(mode=0o700, exist_ok=True)
+        for name in names:
+            if not NAME_RE.fullmatch(name):
+                raise ValueError(f"invalid libvirt VM name for current-guest link: {name!r}")
+            source = xml_dir / f"{name}.xml"
+            link = links_dir / name
+            if not source.is_file():
+                print(f"current-guest: нет постоянного XML: {source}", file=sys.stderr)
+                errors += 1
+                continue
+            if link.is_symlink():
+                if link.readlink() == source:
+                    continue
+                link.unlink()
+            elif link.exists():
+                print(f"current-guest: файл занят: {link}", file=sys.stderr)
+                errors += 1
+                continue
+            link.symlink_to(source)
+        for link in links_dir.iterdir():
+            if link.name not in names and link.is_symlink() and link.readlink().parent == xml_dir:
+                link.unlink()
+    except (OSError, ValueError) as error:
+        print(f"current-guest: {error}", file=sys.stderr)
+        errors += 1
+    return errors
+
+
 def load_config(path: Path) -> dict:
     with path.open("rb") as file:
         config = tomllib.load(file)
@@ -37,6 +83,9 @@ def load_config(path: Path) -> dict:
     for field in ("libvirt_uri",):
         if not isinstance(host.get(field), str) or not host[field]:
             raise ValueError(f"{path}: host.{field} must be a non-empty string")
+    xml_directory = host.get("domain_xml_directory", "/etc/libvirt/qemu")
+    if not isinstance(xml_directory, str) or not Path(xml_directory).is_absolute():
+        raise ValueError(f"{path}: host.domain_xml_directory must be an absolute path")
     storage = config.get("storage", {})
     if not isinstance(storage, dict) or not isinstance(storage.get("directory"), str) or not Path(storage["directory"]).is_absolute():
         raise ValueError(f"{path}: storage.directory must be an absolute path")
@@ -122,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
             "vm", nargs="?", metavar="ИМЯ", help="Имя локальной ВМ; без имени проверяется хост")
     add("audit", "Сверить все локальные ВМ с NetBox; вывести расхождения, ничего не меняя. Нужен API-ключ.",
         "vmctl audit")
-    add("list", "Показать таблицу локальных ВМ: состояние, ресурсы, автозапуск, IP из NetBox и URL дисплея.", "vmctl list")
+    add("list", "Показать таблицу ВМ: состояние, CPU, RAM и диск в ГиБ, host-интерфейсы, IP, URL дисплея и UUID.", "vmctl list")
 
     prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
                   "vmctl prepare local/guest.toml",
@@ -273,6 +322,7 @@ def show_list(config: dict) -> int:
     """Show local domains with NetBox primary addresses when available."""
     names = local_names(config)
     if not names:
+        refresh_guest_links(config, names)
         print("Локальных ВМ нет.")
         return 0
     records = {}
@@ -283,32 +333,35 @@ def show_list(config: dict) -> int:
         except NetBoxError as error:
             print(f"NetBox недоступен; IP-адреса не показаны: {error}", file=sys.stderr)
 
-    headings = ("Имя", "Состояние", "CPU", "RAM MiB", "Диск GiB", "Авто", "IPv4", "IPv6", "Дисплей / URL")
+    headings = ("Имя", "Состояние", "CPU", "RAM GiB", "Диск GiB", "Авто", "Интерфейс", "IPv4", "IPv6", "Дисплей / URL", "UUID")
     rows = []
     failed = False
     for name in names:
         try:
             vm = inspect_vm(config, name)
             display = inspect_display(config, name)
-            disk_gib = vm["disk_mb"] / 1024
-            disk_text = f"{disk_gib:.1f}".rstrip("0").rstrip(".") if disk_gib else "0"
+            def gib_text(mib: int) -> str:
+                gib = mib / 1024
+                return f"{gib:.3f}".rstrip("0").rstrip(".") if gib else "0"
             record = records.get(name, {})
 
             def primary_ip(family: str) -> str:
                 ip = record.get(f"primary_ip{family}")
                 return ip.get("address", "-") if isinstance(ip, dict) else "-"
             rows.append((name, "запущена" if vm["status"] == "active" else "выключена",
-                         str(vm["vcpus"]), str(vm["memory_mb"]), disk_text,
-                         "да" if vm["autostart"] else "нет", primary_ip("4"), primary_ip("6"),
-                         display_url(display)))
+                         str(vm["vcpus"]), gib_text(vm["memory_mb"]), gib_text(vm["disk_mb"]),
+                         "да" if vm["autostart"] else "нет",
+                         ",".join(item["host_dev"] for item in vm["interfaces"] if item.get("host_dev")) or "-",
+                         primary_ip("4"), primary_ip("6"), display_url(display), vm.get("uuid") or "-"))
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             failed = True
             print(f"{name}: не удалось прочитать параметры: {error}", file=sys.stderr)
-            rows.append((name, "ошибка", "-", "-", "-", "-", "-", "-", "-"))
+            rows.append((name, *("-" for _ in range(len(headings) - 1))))
 
     widths = [max(len(str(row[index])) for row in (headings, *rows)) for index in range(len(headings))]
     for row in (headings, *rows):
         print("  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)).rstrip())
+    refresh_guest_links(config, names)
     return 1 if failed else 0
 
 
@@ -1063,7 +1116,10 @@ def main() -> int:
 
     if args.command in ("disk", "nic", "delete"):
         try:
-            return delete_vm(config, args) if args.command == "delete" else component_command(config, args)
+            result = delete_vm(config, args) if args.command == "delete" else component_command(config, args)
+            if result == 0 and not args.dry_run:
+                refresh_guest_links(config)
+            return result
         except (NetBoxError, ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"{args.command} failed: {error}", file=sys.stderr)
             if has_netbox_key(config):
@@ -1076,7 +1132,10 @@ def main() -> int:
                 return check_vm(config, args.vm) if args.vm else check_host(config)
             if args.command == "audit":
                 return audit(config)
-            return adopt(config, args.dry_run, args.vm)
+            result = adopt(config, args.dry_run, args.vm)
+            if result == 0 and not args.dry_run:
+                refresh_guest_links(config)
+            return result
         except (NetBoxError, ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"{args.command} failed: {error}", file=sys.stderr)
             return 1
@@ -1098,9 +1157,15 @@ def main() -> int:
             return 1
 
     if args.command == "sync" and args.vm is None:
-        return sync_all(config, args)
+        result = sync_all(config, args)
+        if not args.dry_run:
+            refresh_guest_links(config)
+        return result
     if args.command in ("create", "prepare", "sync"):
-        return provision_command(config, args)
+        result = provision_command(config, args)
+        if result == 0 and args.command != "prepare" and not args.dry_run:
+            refresh_guest_links(config)
+        return result
 
     virsh_args = {
         "start": ["start", getattr(args, "vm", "")],

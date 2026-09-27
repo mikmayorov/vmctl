@@ -1,5 +1,7 @@
 [host]
 libvirt_uri = "qemu:///system"
+# Optional when libvirt stores persistent domain XML outside /etc/libvirt/qemu.
+# domain_xml_directory = "/etc/libvirt/qemu"
 
 [storage]
 # Replace with the disk directory on this host. New VM requests copy it to NetBox.
