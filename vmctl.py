@@ -171,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
             "vm", nargs="?", metavar="ИМЯ", help="Имя локальной ВМ; без имени проверяется хост")
     add("audit", "Сверить все локальные ВМ с NetBox; вывести расхождения, ничего не меняя. Нужен API-ключ.",
         "vmctl audit")
-    add("list", "Показать таблицу ВМ: состояние, CPU, RAM и диск в ГиБ, host-интерфейсы, IP, URL дисплея и UUID.", "vmctl list")
+    add("list", "Показать таблицу ВМ: состояние, CPU, RAM и диск в десятичных GB, host-интерфейсы, IP, URL дисплея и UUID.", "vmctl list")
 
     prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
                   "vmctl prepare local/guest.toml",
@@ -333,23 +333,24 @@ def show_list(config: dict) -> int:
         except NetBoxError as error:
             print(f"NetBox недоступен; IP-адреса не показаны: {error}", file=sys.stderr)
 
-    headings = ("Имя", "Состояние", "CPU", "RAM GiB", "Диск GiB", "Авто", "Интерфейс", "IPv4", "IPv6", "Дисплей / URL", "UUID")
+    headings = ("Имя", "Состояние", "CPU", "RAM GB", "Диск GB", "Авто", "Интерфейс", "IPv4", "IPv6", "Дисплей / URL", "UUID")
     rows = []
     failed = False
     for name in names:
         try:
             vm = inspect_vm(config, name)
             display = inspect_display(config, name)
-            def gib_text(mib: int) -> str:
-                gib = mib / 1024
-                return f"{gib:.3f}".rstrip("0").rstrip(".") if gib else "0"
+            def gb_text(size_bytes: int) -> str:
+                gb = size_bytes / 1_000_000_000
+                return f"{gb:.3f}".rstrip("0").rstrip(".") if gb else "0"
             record = records.get(name, {})
 
             def primary_ip(family: str) -> str:
                 ip = record.get(f"primary_ip{family}")
                 return ip.get("address", "-") if isinstance(ip, dict) else "-"
             rows.append((name, "запущена" if vm["status"] == "active" else "выключена",
-                         str(vm["vcpus"]), gib_text(vm["memory_mb"]), gib_text(vm["disk_mb"]),
+                         str(vm["vcpus"]), gb_text(vm["memory_mb"] * 1024**2),
+                         gb_text(sum(item["size_bytes"] for item in vm["disks"])),
                          "да" if vm["autostart"] else "нет",
                          ",".join(item["host_dev"] for item in vm["interfaces"] if item.get("host_dev")) or "-",
                          primary_ip("4"), primary_ip("6"), display_url(display), vm.get("uuid") or "-"))
