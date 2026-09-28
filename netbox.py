@@ -261,6 +261,60 @@ def create_vm_components(config: dict, record: dict, interface_name: str = "inet
     ensure_primary_mac(config, interface, mac)
 
 
+def normalize_vm_interface_names(config: dict, record: dict, vm: dict, dry_run: bool) -> bool:
+    """Rename existing VM interfaces to host TAP names without adopting other VM fields."""
+    interfaces = vm_interfaces(config, record["id"])
+    observed = vm.get("interfaces", [])
+    if len(interfaces) != len(observed):
+        raise NetBoxError(f"VM {vm['name']}: interface counts differ; inspect before normalizing names")
+    used = set()
+    plan = []
+    for index, local in enumerate(observed):
+        mac = (local.get("mac_address") or "").lower()
+        match = next((item for item in interfaces if item["id"] not in used and
+                      (item.get("primary_mac_address") or {}).get("mac_address", "").lower() == mac), None)
+        if match is None:
+            raise NetBoxError(f"VM {vm['name']}: no NetBox interface with guest MAC {mac}")
+        used.add(match["id"])
+        host_dev = local.get("host_dev")
+        seed = host_dev if isinstance(host_dev, str) and host_dev.startswith("vm-") else (
+            local.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))
+        target = host_interface_name(vm["name"], seed)
+        plan.append((match, target, local))
+    if len({target for _, target, _ in plan}) != len(plan):
+        raise NetBoxError(f"VM {vm['name']}: duplicate host TAP interface names")
+    renames = [(item, target) for item, target, _ in plan if item["name"] != target]
+    data = dict(record.get("local_context_data") or {})
+    context = dict(data.get("vmctl") or {})
+    bridges = dict(context.get("interface_bridges") or {})
+    new_bridges = dict(bridges)
+    for item, target, _ in plan:
+        if item["name"] != target and item["name"] in new_bridges:
+            new_bridges[target] = new_bridges.pop(item["name"])
+    new_context = dict(context)
+    if new_bridges != bridges:
+        new_context["interface_bridges"] = new_bridges
+    if context.get("interface_name") in {item["name"] for item, _, _ in plan}:
+        new_context["interface_name"] = next(target for item, target, _ in plan
+                                             if item["name"] == context["interface_name"])
+    if not renames and new_context == context:
+        print(f"UNCHANGED {vm['name']} interfaces")
+        return False
+    print(f"{'WOULD UPDATE' if dry_run else 'UPDATED'} {vm['name']} interfaces: {len(renames)} rename(s)")
+    for item, target in renames:
+        print(f"  RENAME VM Interface {item['name']} → {target} (IP and MAC stay assigned)")
+    if dry_run:
+        return True
+    if new_context != context:
+        patch_vm(config, record["id"], {
+            "local_context_data": {**data, "vmctl": new_context},
+            "changelog_message": "vmctl normalized host TAP interface names",
+        })
+    for item, target in renames:
+        _request(config, "PATCH", f"virtualization/interfaces/{item['id']}/", {"name": target})
+    return True
+
+
 def _list_results(config: dict, path: str) -> list[dict]:
     records = []
     while path:

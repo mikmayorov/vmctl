@@ -25,6 +25,25 @@ RECORD = {"id": 42, "name": "guest", "serial": "", "vcpus": 2, "memory": 2048,
 
 
 class AdoptReconcileTests(unittest.TestCase):
+    def test_interface_only_migration_preserves_other_netbox_state(self):
+        tap = host_interface_name("guest", "inet")
+        record = {"id": 42, "name": "guest", "local_context_data": {"vmctl": {
+            "source": "existing", "display": {"type": "vnc", "listen": "192.0.2.10", "port": 5901},
+            "interface_name": "inet", "interface_bridges": {"inet": "br0"}}}}
+        vm = {"name": "guest", "interfaces": [{"name": "inet", "host_dev": tap,
+              "bridge": "br0", "mac_address": "52:54:00:00:00:01"}]}
+        nic = {"id": 8, "name": "inet", "primary_mac_address": {"mac_address": "52:54:00:00:00:01"}}
+        with (patch("netbox.vm_interfaces", return_value=[nic]),
+              patch("netbox.patch_vm") as update,
+              patch("netbox._request") as request,
+              redirect_stdout(io.StringIO())):
+            self.assertTrue(netbox.normalize_vm_interface_names({}, record, vm, False))
+        data = update.call_args.args[2]["local_context_data"]["vmctl"]
+        self.assertEqual(data["display"], record["local_context_data"]["vmctl"]["display"])
+        self.assertEqual(data["interface_bridges"], {tap: "br0"})
+        self.assertEqual(data["interface_name"], tap)
+        request.assert_called_once_with({}, "PATCH", "virtualization/interfaces/8/", {"name": tap})
+
     def test_netbox_spec_excludes_iso_from_libvirt_writable_disks(self):
         record = {**RECORD, "serial": UUID, "disk": 21504,
                   "local_context_data": {"vmctl": {"version": 3, "source": "existing",

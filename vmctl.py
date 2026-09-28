@@ -18,7 +18,7 @@ from pathlib import Path
 from netbox import (
     NetBoxError, COMPONENT_NAME, _request, add_component, create_vm_components, ensure_primary_mac,
     find_device, find_vm, get_vm, has_netbox_key, import_vm, reconcile_adopted_vm, interface_ips, interface_macs, list_vms,
-    local_spec_from_netbox, patch_vm, remove_component, reserve_vm, validate_import_vm, vm_disks, vm_interfaces,
+    local_spec_from_netbox, normalize_vm_interface_names, patch_vm, remove_component, reserve_vm, validate_import_vm, vm_disks, vm_interfaces,
     vm_serial_uuid,
 )
 from inventory import inspect_definition, inspect_display, inspect_vm, local_names
@@ -204,6 +204,8 @@ def build_parser() -> argparse.ArgumentParser:
     adopt_cmd = add("adopt", "Перенести фактические параметры локальных ВМ в NetBox, включая имена TAP интерфейсов; без имени обработать все. Libvirt не меняется.",
                     "vmctl --dry-run adopt guest")
     adopt_cmd.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна локальная ВМ; без имени все ВМ хоста")
+    adopt_cmd.add_argument("--interfaces-only", action="store_true",
+                           help="Переименовать только VM Interfaces по TAP хоста; прочие поля NetBox сохранить")
 
     disk = add("disk", "Добавить или удалить диск выключенной ВМ. При наличии ключа сначала меняет NetBox.",
                "vmctl disk add guest data --size-gb 20")
@@ -755,7 +757,7 @@ def audit(config: dict) -> int:
     return 1 if problems else 0
 
 
-def adopt(config: dict, dry_run: bool, name: str | None = None) -> int:
+def adopt(config: dict, dry_run: bool, name: str | None = None, interfaces_only: bool = False) -> int:
     require_netbox(config)
     device_id, cluster_id = find_device(config)
     records = list_vms(config, device_id)
@@ -774,6 +776,12 @@ def adopt(config: dict, dry_run: bool, name: str | None = None) -> int:
             if duplicate:
                 raise NetBoxError(f"VM {vm_name!r} already exists in this cluster on another host")
         vm = inspect_vm(config, vm_name)
+        if interfaces_only:
+            if not existing:
+                raise NetBoxError(f"VM {vm_name!r} is missing in NetBox; full adopt is needed first")
+            record = get_vm(config, vm_name, cluster_id, device_id)
+            normalize_vm_interface_names(config, record, vm, dry_run)
+            continue
         if existing:
             record = get_vm(config, vm_name, cluster_id, device_id)
             reconcile_adopted_vm(config, record, vm, dry_run)
@@ -1322,7 +1330,7 @@ def main() -> int:
                 return check_vm(config, args.vm) if args.vm else check_host(config)
             if args.command == "audit":
                 return audit(config)
-            result = adopt(config, args.dry_run, args.vm)
+            result = adopt(config, args.dry_run, args.vm, args.interfaces_only)
             if result == 0 and not args.dry_run:
                 refresh_guest_links(config)
             return result

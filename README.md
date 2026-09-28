@@ -186,7 +186,7 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 
 #### `adopt`
 
-`vmctl adopt guest` переносит фактические параметры одной локальной ВМ в NetBox, `vmctl adopt` — всех. `vmctl --dry-run adopt` показывает план. Libvirt и IPAM команда не меняет. Device хоста и кластер должны уже существовать.
+`vmctl adopt guest` переносит фактические параметры одной локальной ВМ в NetBox, `vmctl adopt` — всех. `vmctl --dry-run adopt` показывает план. Полный `adopt` обновляет также дисплей и остальные наблюдаемые параметры ВМ. Если требуется **только** привести имена существующих VM Interfaces к именам TAP, используйте `vmctl --dry-run adopt --interfaces-only`, затем `vmctl adopt --interfaces-only` (или добавьте имя ВМ): остальные поля NetBox сохраняются. Libvirt и IPAM команды не меняют. Device хоста и кластер должны уже существовать.
 
 #### `delete`
 
