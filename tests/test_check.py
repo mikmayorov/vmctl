@@ -39,7 +39,9 @@ class CheckTests(unittest.TestCase):
                    "interfaces": [{"name": "vm-guest-123456", "bridge": "br0",
                                    "mac_address": "52:54:00:00:00:01"}]}
         record = {"name": "guest", "status": {"value": "active"},
-                  "start_on_boot": {"value": "on"}}
+                  "start_on_boot": {"value": "on"},
+                  "primary_ip4": {"address": "192.0.2.10/24"},
+                  "primary_ip6": {"address": "2001:db8::10/64"}}
         with (patch("vmctl.inspect_vm", return_value=live),
               patch("vmctl.inspect_definition", return_value=persistent),
               patch("vmctl.inspect_display", return_value={"type": "none"}),
@@ -57,8 +59,12 @@ class CheckTests(unittest.TestCase):
         self.assertIn("NIC guest:              52:54:00:00:00:01", report)
         self.assertIn("NIC host:               vm-guest-123456 / master br0", report)
         self.assertIn("vnet11 / master br0", report)
+        self.assertRegex(report, r"Primary IPv4\s+192\.0\.2\.10/24\s+—\s+—")
+        self.assertRegex(report, r"Primary IPv6\s+2001:db8::10/64\s+—\s+—")
+        self.assertNotIn("TAP хоста", report)
         self.assertRegex(report, r"Автозапуск\s+да\s+да\s+—")
         self.assertIn("Ожидают перезапуска: CPU/RAM/HDD, NIC host:", report)
+        self.assertIn("\nПути:\n  XML: /etc/libvirt/qemu/guest.xml\n  Диск vda: /disk.qcow2", report)
         self.assertNotIn("Расхождение NetBox", report)
 
     def test_host_check_combines_diagnostics_version_pools_and_networks(self):

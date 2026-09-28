@@ -994,8 +994,14 @@ def check_vm(config: dict, name: str) -> int:
     rows = []
     netbox_diffs = []
     pending = []
-    for label in ("UUID", "CPU/RAM/HDD", "NIC guest:", "NIC host:", "Дисплей URL/Password",
+    for label in ("UUID", "CPU/RAM/HDD", "NIC guest:", "NIC host:", "Primary IPv4", "Primary IPv6",
+                  "Дисплей URL/Password",
                   "Питание", "Автозапуск", "Description", "Носители"):
+        if label in ("Primary IPv4", "Primary IPv6"):
+            ip = record.get(f"primary_ip{label[-1]}") if record else None
+            address = ip.get("address") if isinstance(ip, dict) else None
+            rows.append((label, address or "—", "—", "—", False))
+            continue
         if label == "UUID":
             expected, defined, current = (view.get("uuid") if view else None for view in (desired, persistent, live))
         elif label == "CPU/RAM/HDD":
@@ -1040,22 +1046,6 @@ def check_vm(config: dict, name: str) -> int:
 
     print(f"ВМ: {name}")
     _check_table(rows)
-    xml_paths = [item.get("path") for item in persistent.get("disks", []) + persistent.get("mounted_media", [])]
-    print("Пути XML: " + ("; ".join(path for path in xml_paths if path) or "—"))
-    if desired and (_check_value(desired, "Диски") != _check_value(persistent, "Диски") or
-                    _check_value(desired, "ISO") != _check_value(persistent, "ISO")):
-        wanted_paths = [item.get("path") for item in desired.get("disks", []) + desired.get("mounted_media", [])]
-        print("Пути NetBox: " + "; ".join(path for path in wanted_paths if path))
-    if record:
-        for family in ("4", "6"):
-            ip = record.get(f"primary_ip{family}")
-            print(f"Primary IPv{family}: {ip.get('address', '—') if isinstance(ip, dict) else '—'}")
-    if live:
-        for interface in live.get("interfaces", []):
-            device = interface.get("host_dev")
-            if device and (Path("/sys/class/net") / device / "address").is_file():
-                tap_mac = (Path("/sys/class/net") / device / "address").read_text().strip()
-                print(f"TAP хоста {device}: {tap_mac} (MAC гостя указан в таблице)")
     if netbox_error:
         print(f"NetBox: {netbox_error}")
     if pending:
@@ -1064,6 +1054,19 @@ def check_vm(config: dict, name: str) -> int:
         print("Расхождение NetBox: " + ", ".join(netbox_diffs))
     if not netbox_error and not netbox_diffs and not pending:
         print("Состояния согласованы" if desired else "Локальные данные показаны")
+    print("\nПути:")
+    xml_directory = config["host"].get("domain_xml_directory")
+    if xml_directory is None and config["host"]["libvirt_uri"] == "qemu:///system":
+        xml_directory = "/etc/libvirt/qemu"
+    print(f"  XML: {Path(xml_directory) / f'{name}.xml' if xml_directory else '—'}")
+    for label, items in (("Диск", persistent.get("disks", [])),
+                         ("ISO", persistent.get("mounted_media", []))):
+        for item in items:
+            print(f"  {label} {item.get('target') or '?'}: {item.get('path') or '—'}")
+    if desired and (_check_value(desired, "Диски") != _check_value(persistent, "Диски") or
+                    _check_value(desired, "ISO") != _check_value(persistent, "ISO")):
+        wanted_paths = [item.get("path") for item in desired.get("disks", []) + desired.get("mounted_media", [])]
+        print("  Пути NetBox: " + "; ".join(path for path in wanted_paths if path))
     return 1 if netbox_error or netbox_diffs else 0
 
 
