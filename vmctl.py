@@ -890,10 +890,13 @@ def _check_column(view: dict | None, field: str, disk_sizes: dict[str, int] | No
                  or (disk_sizes or {}).get(item.get("path")) for item in view.get("disks", [])]
         disk = f"{sum(sizes)} MiB" if sizes and all(size is not None for size in sizes) else "? MiB"
         return f"{view.get('vcpus', '?')} / {view.get('memory_mb', '?')} MiB / {disk}"
-    if field == "DEV-NAME/DEV-MAC":
+    if field == "NIC guest:":
+        interfaces = view.get("interfaces", [])
+        return "; ".join((item.get("mac_address") or "?").lower() for item in interfaces) or "—"
+    if field == "NIC host:":
         interfaces = view.get("interfaces", [])
         return "; ".join(f"{(item.get('host_dev') if host_names else item.get('name')) or '?'} / "
-                         f"{(item.get('mac_address') or '?').lower()} @ {item.get('bridge') or '?'}"
+                         f"master {item.get('master', item.get('bridge')) or '?'}"
                          for item in interfaces) or "—"
     if field == "Дисплей URL/Password":
         display = view.get("display")
@@ -933,10 +936,23 @@ def _check_table(rows: list[tuple[str, str, str, str, bool]]) -> None:
             print(line.rstrip())
 
 
+def _tap_master(device: str | None) -> str | None:
+    if not device:
+        return None
+    link = Path("/sys/class/net") / device / "master"
+    try:
+        return link.resolve(strict=True).name
+    except (OSError, RuntimeError):
+        return None
+
+
 def check_vm(config: dict, name: str) -> int:
     local = inspect_vm(config, name)
     persistent = inspect_definition(config, name)
     live = {**local, "display": inspect_display(config, name)} if local["status"] == "active" else None
+    if live:
+        live["interfaces"] = [{**item, "master": _tap_master(item.get("host_dev"))}
+                              for item in live.get("interfaces", [])]
     record = None
     desired = None
     netbox_error = None
@@ -966,21 +982,28 @@ def check_vm(config: dict, name: str) -> int:
     def cpu_ram_disk(view: dict | None):
         return (view.get("vcpus"), view.get("memory_mb"), sizes(view)) if view else None
 
-    def nics(view: dict | None, key: str):
-        return tuple(sorted((item.get(key), (item.get("mac_address") or "").lower(), item.get("bridge"))
-                            for item in view.get("interfaces", []))) if view else None
+    def nics(view: dict | None, field: str, key: str):
+        if view is None:
+            return None
+        if field == "NIC guest:":
+            return tuple(sorted((item.get("mac_address") or "").lower()
+                                for item in view.get("interfaces", [])))
+        return tuple(sorted((item.get(key), item.get("master", item.get("bridge")))
+                            for item in view.get("interfaces", [])))
 
     rows = []
     netbox_diffs = []
     pending = []
-    for label in ("UUID", "CPU/RAM/HDD", "DEV-NAME/DEV-MAC", "Дисплей URL/Password",
+    for label in ("UUID", "CPU/RAM/HDD", "NIC guest:", "NIC host:", "Дисплей URL/Password",
                   "Питание", "Автозапуск", "Description", "Носители"):
         if label == "UUID":
             expected, defined, current = (view.get("uuid") if view else None for view in (desired, persistent, live))
         elif label == "CPU/RAM/HDD":
             expected, defined, current = (cpu_ram_disk(view) for view in (desired, xml_view, live))
-        elif label == "DEV-NAME/DEV-MAC":
-            expected, defined, current = nics(desired, "name"), nics(persistent, "host_dev"), nics(live, "host_dev")
+        elif label in ("NIC guest:", "NIC host:"):
+            expected = nics(desired, label, "name")
+            defined = nics(persistent, label, "host_dev")
+            current = nics(live, label, "host_dev")
         elif label == "Дисплей URL/Password":
             expected = _check_value(desired, "Дисплей") if desired else None
             defined = _check_value(persistent, "Дисплей")

@@ -43,6 +43,7 @@ class CheckTests(unittest.TestCase):
         with (patch("vmctl.inspect_vm", return_value=live),
               patch("vmctl.inspect_definition", return_value=persistent),
               patch("vmctl.inspect_display", return_value={"type": "none"}),
+              patch("vmctl._tap_master", return_value="br0"),
               patch("vmctl.has_netbox_key", return_value=True),
               patch("vmctl.find_device", return_value=(1, 2)),
               patch("vmctl.list_vms", return_value=[record]),
@@ -53,8 +54,10 @@ class CheckTests(unittest.TestCase):
         self.assertIn("NetBox", report)
         self.assertIn("XML (следующий запуск)", report)
         self.assertIn("Mem (сейчас)", report)
-        self.assertIn("DEV-NAME/DEV-MAC", report)
-        self.assertIn("Ожидают перезапуска: CPU/RAM/HDD, DEV-NAME/DEV-MAC", report)
+        self.assertIn("NIC guest:              52:54:00:00:00:01", report)
+        self.assertIn("NIC host:               vm-guest-123456 / master br0", report)
+        self.assertIn("vnet11 / master br0", report)
+        self.assertIn("Ожидают перезапуска: CPU/RAM/HDD, NIC host:", report)
         self.assertNotIn("Расхождение NetBox", report)
 
     def test_host_check_combines_diagnostics_version_pools_and_networks(self):
