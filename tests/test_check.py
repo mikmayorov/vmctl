@@ -4,7 +4,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from vmctl import _check_table, check_host, check_vm
+from vmctl import _check_heading, _check_table, check_host, check_vm
 
 
 CONFIG = {"host": {"libvirt_uri": "qemu:///system"}}
@@ -19,6 +19,14 @@ class CheckTests(unittest.TestCase):
             _check_table([("UUID", "one", "two", "two", True)])
         self.assertIn("\x1b[31m! UUID", output.getvalue())
         self.assertIn("\x1b[0m", output.getvalue())
+
+    def test_check_heading_is_bold_on_terminal(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        with redirect_stdout(Terminal()) as output:
+            _check_heading("guest", "Состояния согласованы")
+        self.assertEqual(output.getvalue(), "\x1b[1mВМ: guest (Состояния согласованы)\x1b[0m\n")
 
     def test_check_compares_netbox_persistent_and_live(self):
         persistent = {
@@ -53,6 +61,7 @@ class CheckTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(check_vm(CONFIG, "guest"), 0)
         report = output.getvalue()
+        self.assertIn("ВМ: guest (Ожидают перезапуска)", report)
         self.assertIn("NetBox", report)
         self.assertIn("XML/libvirt (следующий запуск)", report)
         self.assertIn("Mem (сейчас)", report)

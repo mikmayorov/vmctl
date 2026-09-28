@@ -936,6 +936,11 @@ def _check_table(rows: list[tuple[str, str, str, str, bool]]) -> None:
             print(line.rstrip())
 
 
+def _check_heading(name: str, status: str) -> None:
+    heading = f"ВМ: {name} ({status})"
+    print(f"\033[1m{heading}\033[0m" if sys.stdout.isatty() else heading)
+
+
 def _tap_master(device: str | None) -> str | None:
     if not device:
         return None
@@ -1044,17 +1049,23 @@ def check_vm(config: dict, name: str) -> int:
             mem_value = _check_column(live, label, host_names=True)
         rows.append((label, netbox_value, xml_value, mem_value, nb_diff or xml_diff))
 
-    print(f"ВМ: {name}")
-    _check_table(rows)
+    if netbox_error:
+        status = "Ошибка NetBox"
+    elif netbox_diffs:
+        status = "Расхождение NetBox"
+    elif pending:
+        status = "Ожидают перезапуска"
+    else:
+        status = "Состояния согласованы" if desired else "Локальные данные показаны"
+    _check_heading(name, status)
     if netbox_error:
         print(f"NetBox: {netbox_error}")
     if pending:
         print("Ожидают перезапуска: " + ", ".join(pending))
     if netbox_diffs:
         print("Расхождение NetBox: " + ", ".join(netbox_diffs))
-    if not netbox_error and not netbox_diffs and not pending:
-        print("Состояния согласованы" if desired else "Локальные данные показаны")
-    print("\nПути:")
+    _check_table(rows)
+    print("Пути:")
     xml_directory = config["host"].get("domain_xml_directory")
     if xml_directory is None and config["host"]["libvirt_uri"] == "qemu:///system":
         xml_directory = "/etc/libvirt/qemu"
