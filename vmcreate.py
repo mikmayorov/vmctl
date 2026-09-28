@@ -33,6 +33,8 @@ def interface_alias(name: str) -> str:
 
 def host_interface_name(vm_name: str, interface_name: str) -> str:
     """Stable Linux tap name (at most 15 bytes) that identifies its VM."""
+    if re.fullmatch(r"vm-[a-z0-9-]+-[0-9a-f]{6}", interface_name) and len(interface_name) <= 15:
+        return interface_name
     label = re.sub(r"[^a-z0-9]", "-", vm_name.lower())[:5]
     digest = hashlib.blake2s(f"{vm_name}\0{interface_name}".encode(), digest_size=3).hexdigest()
     return f"vm-{label}-{digest}"

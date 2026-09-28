@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import netbox
+from vmcreate import host_interface_name
 
 
 UUID = "00000000-0000-4000-8000-000000000123"
@@ -94,7 +95,9 @@ class AdoptReconcileTests(unittest.TestCase):
         self.assertEqual((vm_changes["vcpus"], vm_changes["memory"]), (4, 4096))
         self.assertEqual(vm_changes["local_context_data"]["vmctl"]["mounted_media"],
                          [{"name": "media-sda", "target": "sda"}])
-        self.assertEqual(vm_changes["local_context_data"]["vmctl"]["interface_bridges"], {"public": "br0"})
+        tap = host_interface_name("guest", "inet")
+        self.assertEqual(vm_changes["local_context_data"]["vmctl"]["interface_bridges"], {tap: "br0"})
+        self.assertIn(("PATCH", "virtualization/interfaces/8/", {"name": tap}), calls)
         self.assertIn(("PATCH", "virtualization/virtual-disks/5/",
                        {"size": 20480, "description": "/images/guest.qcow2"}), calls)
         self.assertIn(("add", "disk", {"virtual_machine": 42, "name": "disk-vdb", "size": 5121,

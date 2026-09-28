@@ -22,8 +22,8 @@ class DisplayTests(unittest.TestCase):
              patch("vmctl.inspect_vm", return_value=VM), \
              patch("vmctl.has_netbox_key", return_value=False), redirect_stdout(output):
             self.assertEqual(check_vm(CONFIG, "guest"), 0)
-        self.assertIn("Дисплей: vnc://192.0.2.10:5906", output.getvalue())
-        self.assertIn('пароль "demo1234"', output.getvalue())
+        self.assertIn("vnc://192.0.2.10:5906", output.getvalue())
+        self.assertIn('"demo1234"', output.getvalue())
 
     def test_display_without_graphics(self):
         with patch("inventory._virsh", return_value="<domain><devices/></domain>"):
@@ -39,7 +39,7 @@ class DisplayTests(unittest.TestCase):
              patch("vmctl.has_netbox_key", return_value=False), redirect_stdout(output):
             check_vm(CONFIG, "guest")
         self.assertIn("SPICE 127.0.0.1 (порт при запуске)", output.getvalue())
-        self.assertIn("пароль не задан", output.getvalue())
+        self.assertIn("SPICE 127.0.0.1 (порт при запуске) / —", output.getvalue())
 
 
 if __name__ == "__main__":

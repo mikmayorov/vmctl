@@ -56,6 +56,20 @@ class ComponentTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertLessEqual(len(first.encode()), 15)
         self.assertTrue(first.startswith("vm-very-"))
+        self.assertEqual(host_interface_name("guest", first), first)
+
+    def test_managed_nic_add_names_netbox_interface_after_host_tap(self):
+        args = Namespace(command="nic", action="add", vm="guest", name="backup",
+                         bridge=None, mac=None, dry_run=False)
+        config = {"netbox": {"key": "secret"}}
+        with (patch("vmctl._stopped", return_value=False),
+              patch("vmctl.find_device", return_value=(1, 2)),
+              patch("vmctl.get_vm", return_value={"id": 7, "name": "guest"}),
+              patch("vmctl.vm_interfaces", return_value=[]),
+              patch("vmctl.add_component", return_value={"id": 8}) as add,
+              patch("vmctl.ensure_primary_mac")):
+            self.assertEqual(vmctl.component_command(config, args), 0)
+        self.assertEqual(add.call_args.args[2]["name"], host_interface_name("guest", "backup"))
 
     def test_dry_run_plans_tap_name_change_for_running_vm(self):
         with tempfile.TemporaryDirectory() as directory:

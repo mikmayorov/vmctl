@@ -11,6 +11,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from vmcreate import host_interface_name
+
 
 class NetBoxError(Exception):
     pass
@@ -246,15 +248,16 @@ def create_vm_components(config: dict, record: dict, interface_name: str = "inet
             })
         elif int(media["size"]) != size or media.get("description") != iso:
             raise NetBoxError(f"VM {record['name']}: ISO Virtual Disk differs from the preparation request")
+    tap_name = host_interface_name(record["name"], interface_name)
     interfaces = vm_interfaces(config, vm_id)
     if not interfaces:
         interface = _request(config, "POST", "virtualization/interfaces/", {
-            "virtual_machine": vm_id, "name": interface_name, "enabled": True,
+            "virtual_machine": vm_id, "name": tap_name, "enabled": True,
         })
     else:
-        interface = next((item for item in interfaces if item["name"] == interface_name), None)
+        interface = next((item for item in interfaces if item["name"] in (tap_name, interface_name)), None)
         if interface is None:
-            raise NetBoxError(f"NetBox interface {interface_name!r} is missing for {record['name']}")
+            raise NetBoxError(f"NetBox interface {tap_name!r} is missing for {record['name']}")
     ensure_primary_mac(config, interface, mac)
 
 
@@ -299,7 +302,9 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     named_disks = [{**item, "name": vm["name"] if index == 0 else f"disk-{index + 1}"}
                    for index, item in enumerate(local_disks)]
     media_disks = named_media(vm)
-    named_interfaces = [{**item, "name": item.get("name") or ("inet" if index == 0 else f"net-{index + 1}")}
+    named_interfaces = [{**item, "name": host_interface_name(vm["name"],
+                         item.get("host_dev") if str(item.get("host_dev") or "").startswith("vm-") else
+                         item.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))}
                         for index, item in enumerate(local_interfaces)]
     payload = {
         "name": vm["name"], "serial": serial, "cluster": cluster_id, "device": device_id,
@@ -311,7 +316,8 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
             "version": 3, "source": "existing", "bridge": vm.get("bridge"),
             "mounted_media": [{"name": item["name"], "target": item["target"]} for item in media_disks],
             "interface_bridges": {item["name"]: item["bridge"] for item in named_interfaces},
-            "interface_name": "inet", "display": vm.get("display"),
+            "interface_name": named_interfaces[0]["name"] if named_interfaces else None,
+            "display": vm.get("display"),
         }},
         "changelog_message": "Imported existing libvirt VM with vmctl",
     }
@@ -417,13 +423,18 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
         if match is None:
             name = local.get("name") or ("inet" if index == 0 else f"net-{index + 1}")
             match = next((item for item in interfaces if item["id"] not in used_nics and item["name"] == name), None)
-        name = match["name"] if match else (local.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))
+        host_dev = local.get("host_dev")
+        logical_name = (host_dev if isinstance(host_dev, str) and host_dev.startswith("vm-") else
+                        local.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))
+        name = host_interface_name(vm["name"], logical_name)
         if not COMPONENT_NAME.fullmatch(name):
             raise NetBoxError(f"VM {vm['name']}: invalid interface name {name!r}")
         if match:
             used_nics.add(match["id"])
         nic_plan.append((local, match, name))
     stale_nics = [item for item in interfaces if item["id"] not in used_nics]
+    if len({name for _, _, name in nic_plan}) != len(nic_plan):
+        raise NetBoxError(f"VM {vm['name']}: duplicate host TAP interface names")
     for item in stale_nics:
         if interface_ips(config, item["id"]):
             raise NetBoxError(f"VM {vm['name']}: interface {item['name']} has IP addresses; unassign them in NetBox before adoption")
@@ -460,7 +471,8 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
                     if match is None or int(match["size"]) != local["size_mb"]
                     or match.get("description") != local["path"]]
     nic_changes = [(local, match, name) for local, match, name in nic_plan
-                   if match is None or (match.get("primary_mac_address") or {}).get("mac_address", "").lower()
+                   if match is None or match["name"] != name or
+                   (match.get("primary_mac_address") or {}).get("mac_address", "").lower()
                    != local["mac_address"].lower()]
     if not (changes or disk_changes or stale_disks or nic_changes or stale_nics):
         print(f"UNCHANGED {vm['name']}")
@@ -475,6 +487,9 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
               f"{local['size_mb']} MiB; Description {local['path']}")
     for item in stale_disks:
         print(f"  REMOVE Virtual Disk {item['name']}")
+    for _, match, name in nic_changes:
+        if match and match["name"] != name:
+            print(f"  RENAME VM Interface {match['name']} → {name} (IP and MAC stay assigned)")
     if dry_run:
         return True
     if changes:
@@ -491,6 +506,8 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
     for local, match, name in nic_changes:
         if match is None:
             match = add_component(config, "nic", {"virtual_machine": vm_id, "name": name, "enabled": True})
+        elif match["name"] != name:
+            _request(config, "PATCH", f"virtualization/interfaces/{match['id']}/", {"name": name})
         primary = match.get("primary_mac_address")
         if primary and primary.get("mac_address", "").lower() != local["mac_address"].lower():
             _request(config, "PATCH", f"dcim/mac-addresses/{primary['id']}/", {"mac_address": local["mac_address"]})
@@ -533,7 +550,7 @@ def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
                 "user_data": vm.get("user_data"),
                 "bridge": bridge,
                 "storage_directory": storage_directory,
-                "interface_name": vm.get("interface_name", "inet"),
+                "interface_name": host_interface_name(vm["name"], vm.get("interface_name", "inet")),
                 "mounted_media": [{"name": "media-sda", "target": "sda"}] if vm["source"] == "iso" else [],
                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }

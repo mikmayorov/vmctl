@@ -14,7 +14,7 @@ import netbox
 import inventory
 import vmctl
 from vmctl import load_config, resolve_creation_spec
-from vmcreate import create_vm, domain_xml, validate_spec, verify_local_vm
+from vmcreate import create_vm, domain_xml, host_interface_name, validate_spec, verify_local_vm
 
 
 class CreationTests(unittest.TestCase):
@@ -252,7 +252,7 @@ class NetBoxTests(unittest.TestCase):
             "local_context_data": {"vmctl": {
                 "version": 3, "source": "iso", "iso": "/images/installer.iso",
                 "image": None, "user_data": None, "bridge": "br1",
-                "storage_directory": "/images", "interface_name": "inet",
+                "storage_directory": "/images", "interface_name": host_interface_name("test-vm", "inet"),
                 "mounted_media": [{"name": "media-sda", "target": "sda"}],
                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }},
@@ -317,6 +317,8 @@ class NetBoxTests(unittest.TestCase):
         ])
         self.assertEqual(calls[3][2]["assigned_object_type"], "virtualization.vminterface")
         self.assertEqual(calls[0][2]["description"], "/images/test-vm.qcow2")
+        self.assertEqual(next(payload["name"] for method, path, payload in calls
+                              if path == "virtualization/interfaces/"), host_interface_name("test-vm", "inet"))
 
     def test_config_with_key_requires_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,13 +4,22 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from vmctl import check_host, check_vm
+from vmctl import _check_table, check_host, check_vm
 
 
 CONFIG = {"host": {"libvirt_uri": "qemu:///system"}}
 
 
 class CheckTests(unittest.TestCase):
+    def test_check_marks_entire_different_row_red_on_terminal(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+        with redirect_stdout(Terminal()) as output:
+            _check_table([("UUID", "one", "two", "two", True)])
+        self.assertIn("\x1b[31m! UUID", output.getvalue())
+        self.assertIn("\x1b[0m", output.getvalue())
+
     def test_check_compares_netbox_persistent_and_live(self):
         persistent = {
             "uuid": "00000000-0000-4000-8000-000000000001", "vcpus": 4,
@@ -22,11 +31,12 @@ class CheckTests(unittest.TestCase):
         }
         live = {**persistent, "vcpus": 2, "memory_mb": 2048,
                 "status": "active", "autostart": True,
+                "disks": [{"target": "vda", "path": "/disk.qcow2", "size_mb": 10240}],
                 "interfaces": [{"bridge": "br0", "mac_address": "52:54:00:00:00:01",
                                 "host_dev": "vnet11"}]}
         desired = {**persistent,
                    "disks": [{"name": "guest", "path": "/disk.qcow2", "size_mb": 10240}],
-                   "interfaces": [{"name": "inet", "bridge": "br0",
+                   "interfaces": [{"name": "vm-guest-123456", "bridge": "br0",
                                    "mac_address": "52:54:00:00:00:01"}]}
         record = {"name": "guest", "status": {"value": "active"},
                   "start_on_boot": {"value": "on"}}
@@ -40,13 +50,12 @@ class CheckTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(check_vm(CONFIG, "guest"), 0)
         report = output.getvalue()
-        self.assertIn("NetBox (требуемое)", report)
-        self.assertIn("Постоянный XML", report)
-        self.assertIn("В памяти", report)
-        self.assertIn("PENDING RESTART XML → память: CPU", report)
-        self.assertNotIn("PENDING RESTART XML → память: Интерфейсы", report)
-        self.assertIn("PENDING RESTART XML → память: имя интерфейса хоста", report)
-        self.assertNotIn("DIFF NetBox → XML", report)
+        self.assertIn("NetBox", report)
+        self.assertIn("XML (следующий запуск)", report)
+        self.assertIn("Mem (сейчас)", report)
+        self.assertIn("DEV-NAME/DEV-MAC", report)
+        self.assertIn("Ожидают перезапуска: CPU/RAM/HDD, DEV-NAME/DEV-MAC", report)
+        self.assertNotIn("Расхождение NetBox", report)
 
     def test_host_check_combines_diagnostics_version_pools_and_networks(self):
         output = io.StringIO()
@@ -78,7 +87,7 @@ class CheckTests(unittest.TestCase):
               patch("vmctl.local_spec_from_netbox", return_value=desired),
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(check_vm(CONFIG, "guest"), 1)
-        self.assertIn("DIFF NetBox → файл диска", output.getvalue())
+        self.assertIn("Расхождение NetBox: CPU/RAM/HDD", output.getvalue())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import sys
 import time
 import tomllib
 import uuid
+import textwrap
 from pathlib import Path
 
 from netbox import (
@@ -21,7 +22,7 @@ from netbox import (
     vm_serial_uuid,
 )
 from inventory import inspect_definition, inspect_display, inspect_vm, local_names
-from vmcreate import (NAME_RE, create_vm, interface_alias, pending_purge_file, purge_pending,
+from vmcreate import (NAME_RE, create_vm, host_interface_name, interface_alias, pending_purge_file, purge_pending,
                       redefine_vm, validate_spec, verify_local_vm)
 
 
@@ -175,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
         parsers[command.prog.removeprefix("vmctl ")] = command
         return command
 
-    add("check", "Без имени проверить хост, libvirt, пулы и сети; с именем показать состояние и параметры ВМ.",
+    add("check", "Без имени проверить хост; с именем сравнить NetBox, постоянный XML и работающую ВМ в таблице.",
         "vmctl check guest", details="Для проверки всего хоста выполните vmctl check без имени.").add_argument(
             "vm", nargs="?", metavar="ИМЯ", help="Имя локальной ВМ; без имени проверяется хост")
     add("audit", "Сверить все локальные ВМ с NetBox; вывести расхождения, ничего не меняя. Нужен API-ключ.",
@@ -200,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна ВМ; без имени все ВМ устройства хоста в NetBox")
     sync.add_argument("--purge", action="store_true",
                       help="Удалить файлы управляемых дисков, уже исключённых из NetBox (без имени — у всех ВМ)")
-    adopt_cmd = add("adopt", "Перенести фактические параметры локальных ВМ в NetBox; без имени обработать все. Libvirt не меняется.",
+    adopt_cmd = add("adopt", "Перенести фактические параметры локальных ВМ в NetBox, включая имена TAP интерфейсов; без имени обработать все. Libvirt не меняется.",
                     "vmctl --dry-run adopt guest")
     adopt_cmd.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна локальная ВМ; без имени все ВМ хоста")
 
@@ -224,10 +225,10 @@ def build_parser() -> argparse.ArgumentParser:
     nic = add("nic", "Добавить или удалить интерфейс выключенной ВМ. IP-адреса назначают вручную в NetBox IPAM.",
               "vmctl nic add guest backup --bridge br1")
     nic_actions = nic.add_subparsers(dest="action", required=True, title="Действия", metavar="{add,remove}")
-    nic_add = add("add", "Добавить интерфейс и primary MAC к выключенной ВМ.",
+    nic_add = add("add", "Добавить интерфейс и primary MAC к выключенной ВМ; имя NetBox в управляемом режиме будет именем TAP.",
                   "vmctl nic add guest backup --bridge br1", nic_actions)
     nic_add.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
-    nic_add.add_argument("name", metavar="ИНТЕРФЕЙС", help="Имя нового интерфейса в NetBox")
+    nic_add.add_argument("name", metavar="ИНТЕРФЕЙС", help="Короткое имя нового интерфейса; в NetBox записывается производное имя TAP")
     nic_add.add_argument("--bridge", metavar="МОСТ",
                          help="Существующий мост хоста; без флага берётся мост ВМ или хоста")
     nic_add.add_argument("--mac", metavar="MAC",
@@ -236,7 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
                      "vmctl nic remove guest backup", nic_actions,
                      details="При назначенном интерфейсу IP-адресе в NetBox команда остановится до изменений.")
     nic_remove.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
-    nic_remove.add_argument("name", metavar="ИНТЕРФЕЙС", help="Имя существующего интерфейса")
+    nic_remove.add_argument("name", metavar="ИНТЕРФЕЙС", help="Короткое имя или имя TAP существующего интерфейса")
 
     delete = add("delete", "Удалить выключенную ВМ из libvirt и, при наличии ключа, из NetBox. IP с интерфейсов нужно снять заранее; файлы дисков по умолчанию остаются.",
                  "vmctl --dry-run delete guest --purge",
@@ -474,6 +475,9 @@ def component_command(config: dict, args: argparse.Namespace) -> int:
             raise NetBoxError("VM deletion is pending")
         items = vm_disks(config, record["id"]) if kind == "disk" else vm_interfaces(config, record["id"])
         found = next((item for item in items if item["name"] == component_name), None)
+        if kind == "nic" and found is None:
+            component_name = host_interface_name(name, component_name)
+            found = next((item for item in items if item["name"] == component_name), None)
         if kind == "disk" and action == "add" and not found:
             context = (record.get("local_context_data") or {}).get("vmctl") or {}
             directory = context.get("storage_directory") or config["storage"]["directory"]
@@ -867,110 +871,166 @@ def _check_value(view: dict, field: str, *, auto_port: bool = False):
                      "Description": "description"}[field])
 
 
-def _print_check_view(title: str, view: dict) -> None:
-    print(f"\n{title}:")
-    print(f"  UUID: {view.get('uuid') or '-'}; CPU: {view.get('vcpus', '-')}; RAM: {view.get('memory_mb', '-')} MiB")
-    print(f"  Description: {view.get('description') or '-'}")
-    for disk in view.get("disks", []):
-        size = disk.get("size_mb")
-        if size is None and disk.get("size_bytes") is not None:
-            size = (disk["size_bytes"] + 1024**2 - 1) // 1024**2
-        print(f"  Диск {disk.get('target') or '-'}: {disk.get('path') or '-'}"
-              + (f"; {size} MiB" if size is not None else ""))
-    for media in view.get("mounted_media", []):
-        print(f"  ISO {media.get('target') or '-'}: {media.get('path') or '-'}")
-    for interface in view.get("interfaces", []):
-        print(f"  NIC: {interface.get('bridge') or '-'}; MAC {interface.get('mac_address') or '-'}; "
-              f"host {interface.get('host_dev') or '-'}")
-    display = view.get("display")
-    if display is not None:
+def _check_column(view: dict | None, field: str, disk_sizes: dict[str, int] | None = None,
+                  host_names: bool = False) -> str:
+    if view is None:
+        return "—"
+    if field == "UUID":
+        return view.get("uuid") or "—"
+    if field == "CPU/RAM/HDD":
+        sizes = [item.get("size_mb") or (item.get("size_bytes", 0) + 1024**2 - 1) // 1024**2
+                 or (disk_sizes or {}).get(item.get("path")) for item in view.get("disks", [])]
+        disk = f"{sum(sizes)} MiB" if sizes and all(size is not None for size in sizes) else "? MiB"
+        return f"{view.get('vcpus', '?')} / {view.get('memory_mb', '?')} MiB / {disk}"
+    if field == "DEV-NAME/DEV-MAC":
+        interfaces = view.get("interfaces", [])
+        return "; ".join(f"{(item.get('host_dev') if host_names else item.get('name')) or '?'} / "
+                         f"{(item.get('mac_address') or '?').lower()} @ {item.get('bridge') or '?'}"
+                         for item in interfaces) or "—"
+    if field == "Дисплей URL/Password":
+        display = view.get("display")
+        if display is None:
+            return "—"
         password = display.get("password")
-        print(f"  Дисплей: {display_url(display)}; пароль "
-              f"{json.dumps(password, ensure_ascii=False) if password is not None else 'не задан'}")
+        return f"{display_url(display)} / {json.dumps(password, ensure_ascii=False) if password is not None else '—'}"
+    if field == "Питание":
+        return {"active": "работает", "offline": "выключена", "planned": "planned",
+                "staged": "staged"}.get(view.get("status"), "—")
+    if field == "Автозапуск":
+        return "да" if view.get("autostart") else "нет"
+    if field == "Description":
+        return view.get("description") or "—"
+    if field == "Носители":
+        disks = [Path(item.get("path") or "?").name for item in view.get("disks", [])]
+        media = [f"ISO {Path(item.get('path') or '?').name}" for item in view.get("mounted_media", [])]
+        return "; ".join(disks + media) or "—"
+    raise ValueError(f"unknown check field: {field}")
+
+
+def _check_table(rows: list[tuple[str, str, str, str, bool]]) -> None:
+    width = max(27, min(43, (shutil.get_terminal_size((150, 24)).columns - 20) // 3))
+    label_width = 24
+    def chunks(value: str) -> list[str]:
+        return textwrap.wrap(value, width=width, break_long_words=True, break_on_hyphens=False) or [""]
+    print(f"{'Параметр':<{label_width}}  {'NetBox':<{width}}  {'XML (следующий запуск)':<{width}}  Mem (сейчас)")
+    print("─" * (label_width + 3 * width + 6))
+    for label, desired, xml, live, different in rows:
+        cells = [chunks(value) for value in (desired, xml, live)]
+        height = max(map(len, cells))
+        for index in range(height):
+            line = (f"{('! ' if different else '  ') + label if index == 0 else '':<{label_width}}  "
+                    + "  ".join((cell[index] if index < len(cell) else "").ljust(width) for cell in cells))
+            if different and sys.stdout.isatty():
+                line = f"\033[31m{line}\033[0m"
+            print(line.rstrip())
 
 
 def check_vm(config: dict, name: str) -> int:
     local = inspect_vm(config, name)
     persistent = inspect_definition(config, name)
     live = {**local, "display": inspect_display(config, name)} if local["status"] == "active" else None
-    print(f"ВМ: {name}; питание: {'запущена' if live else 'выключена'}; "
-          f"автозапуск: {'да' if local['autostart'] else 'нет'}")
-
     record = None
     desired = None
-    problems = 0
+    netbox_error = None
     if has_netbox_key(config):
         try:
             device_id, _ = find_device(config)
             record = next((item for item in list_vms(config, device_id) if item.get("name") == name), None)
             if record is None:
-                print("\nNetBox: ВМ отсутствует на устройстве этого хоста")
-                problems += 1
+                netbox_error = "ВМ отсутствует на устройстве этого хоста"
             else:
                 desired = local_spec_from_netbox(record, config)
-                _print_check_view("NetBox (требуемое)", desired)
-                status = record.get("status")
-                print(f"  Статус: {status.get('value') if isinstance(status, dict) else status}")
-                for family in ("4", "6"):
-                    ip = record.get(f"primary_ip{family}")
-                    print(f"  Primary IPv{family}: {ip.get('address', '-') if isinstance(ip, dict) else '-'}")
         except (NetBoxError, ValueError) as error:
-            print(f"\nNetBox: ошибка чтения: {error}")
-            problems += 1
-    else:
-        print("\nNetBox: ключ не задан, учёт отключён")
+            netbox_error = str(error)
 
-    _print_check_view("Постоянный XML (следующий запуск)", persistent)
-    if live:
-        _print_check_view("В памяти (работает сейчас)", live)
-    else:
-        print("\nВ памяти: ВМ выключена")
+    def option(value):
+        return value.get("value") if isinstance(value, dict) else value
 
-    print("\nСравнение:")
-    fields = ("UUID", "CPU", "RAM", "Диски", "ISO", "Интерфейсы", "Дисплей", "Description")
-    if desired:
-        for field in fields:
-            wanted = _check_value(desired, field)
-            if wanted is None and field == "Дисплей":
-                continue
-            actual = _check_value(persistent, field)
-            if wanted != actual:
-                print(f"  DIFF NetBox → XML: {field}")
-                problems += 1
-        current_disks = {item.get("path"): item for item in local.get("disks", [])}
-        for disk in desired.get("disks", []):
-            observed = current_disks.get(disk.get("path"))
-            if observed and disk.get("size_mb") is not None and observed.get("size_mb") is not None \
-                    and observed["size_mb"] != disk["size_mb"]:
-                print(f"  DIFF NetBox → файл диска: {disk['path']}: "
-                      f"{disk['size_mb']} / {observed['size_mb']} MiB")
-                problems += 1
-        expected_status = record.get("status")
-        expected_status = expected_status.get("value") if isinstance(expected_status, dict) else expected_status
-        if expected_status in ("active", "offline") and expected_status != local["status"]:
-            print(f"  DIFF NetBox → питание: ожидается {expected_status}, фактически {local['status']}")
-            problems += 1
-        expected_autostart = record.get("start_on_boot")
-        expected_autostart = expected_autostart.get("value") if isinstance(expected_autostart, dict) else expected_autostart
-        if expected_autostart in ("on", "off") and (expected_autostart == "on") != local["autostart"]:
-            print("  DIFF NetBox → автозапуск")
-            problems += 1
+    if desired is not None:
+        desired = {**desired, "status": option(record.get("status")),
+                   "autostart": option(record.get("start_on_boot")) == "on"}
+    def sizes(view: dict | None) -> tuple:
+        return tuple(sorted((item.get("path"), item.get("size_mb")) for item in view.get("disks", []))) if view else ()
+    local_sizes = {item.get("path"): item.get("size_mb") for item in local.get("disks", [])}
+    xml_view = {**persistent, "disks": [{**item, "size_mb": local_sizes.get(item.get("path"))}
+                                         for item in persistent.get("disks", [])]}
+
+    def cpu_ram_disk(view: dict | None):
+        return (view.get("vcpus"), view.get("memory_mb"), sizes(view)) if view else None
+
+    def nics(view: dict | None, key: str):
+        return tuple(sorted((item.get(key), (item.get("mac_address") or "").lower(), item.get("bridge"))
+                            for item in view.get("interfaces", []))) if view else None
+
+    rows = []
+    netbox_diffs = []
+    pending = []
+    for label in ("UUID", "CPU/RAM/HDD", "DEV-NAME/DEV-MAC", "Дисплей URL/Password",
+                  "Питание", "Автозапуск", "Description", "Носители"):
+        if label == "UUID":
+            expected, defined, current = (view.get("uuid") if view else None for view in (desired, persistent, live))
+        elif label == "CPU/RAM/HDD":
+            expected, defined, current = (cpu_ram_disk(view) for view in (desired, xml_view, live))
+        elif label == "DEV-NAME/DEV-MAC":
+            expected, defined, current = nics(desired, "name"), nics(persistent, "host_dev"), nics(live, "host_dev")
+        elif label == "Дисплей URL/Password":
+            expected = _check_value(desired, "Дисплей") if desired else None
+            defined = _check_value(persistent, "Дисплей")
+            current = (_check_value(live, "Дисплей", auto_port=persistent.get("display", {}).get("port") == "auto")
+                       if live else None)
+        elif label == "Питание":
+            expected, defined, current = desired.get("status") if desired else None, None, local["status"]
+        elif label == "Автозапуск":
+            expected, defined, current = desired.get("autostart") if desired else None, None, local["autostart"]
+        elif label == "Description":
+            expected, defined, current = (view.get("description") if view else None for view in (desired, persistent, live))
+        else:
+            def paths(view: dict | None):
+                return (_check_value(view, "Диски"), _check_value(view, "ISO")) if view else None
+            expected, defined, current = (paths(view) for view in (desired, persistent, live))
+        nb_diff = desired is not None and expected is not None and (
+            expected != current if label in ("Питание", "Автозапуск") else expected != defined)
+        if label == "Питание" and expected not in ("active", "offline"):
+            nb_diff = False
+        xml_diff = live is not None and label not in ("Питание", "Автозапуск") and defined != current
+        if nb_diff:
+            netbox_diffs.append(label)
+        if xml_diff:
+            pending.append(label)
+        netbox_value = _check_column(desired, label) if label not in ("Питание", "Автозапуск") else (
+            _check_column(desired, label) if desired else "—")
+        xml_value = _check_column(xml_view, label, local_sizes, host_names=True) if label not in ("Питание", "Автозапуск") else "—"
+        mem_value = (_check_column(live, label, host_names=True) if live else "—") if label not in ("Питание", "Автозапуск") else (
+            _check_column(local, label))
+        rows.append((label, netbox_value, xml_value, mem_value, nb_diff or xml_diff))
+
+    print(f"ВМ: {name}")
+    _check_table(rows)
+    xml_paths = [item.get("path") for item in persistent.get("disks", []) + persistent.get("mounted_media", [])]
+    print("Пути XML: " + ("; ".join(path for path in xml_paths if path) or "—"))
+    if desired and (_check_value(desired, "Диски") != _check_value(persistent, "Диски") or
+                    _check_value(desired, "ISO") != _check_value(persistent, "ISO")):
+        wanted_paths = [item.get("path") for item in desired.get("disks", []) + desired.get("mounted_media", [])]
+        print("Пути NetBox: " + "; ".join(path for path in wanted_paths if path))
+    if record:
+        for family in ("4", "6"):
+            ip = record.get(f"primary_ip{family}")
+            print(f"Primary IPv{family}: {ip.get('address', '—') if isinstance(ip, dict) else '—'}")
     if live:
-        for field in fields:
-            xml_value = _check_value(persistent, field)
-            live_value = _check_value(live, field,
-                                      auto_port=field == "Дисплей" and persistent.get("display", {}).get("port") == "auto")
-            if xml_value != live_value:
-                print(f"  PENDING RESTART XML → память: {field}")
-        planned_nics = {item.get("mac_address", "").lower(): item.get("host_dev")
-                        for item in persistent.get("interfaces", []) if item.get("host_dev")}
-        current_nics = {item.get("mac_address", "").lower(): item.get("host_dev")
-                        for item in live.get("interfaces", [])}
-        if any(current_nics.get(mac) != host_dev for mac, host_dev in planned_nics.items()):
-            print("  PENDING RESTART XML → память: имя интерфейса хоста")
-    if not problems:
-        print("  NetBox и постоянный XML согласованы" if desired else "  Локальные данные показаны")
-    return 1 if problems else 0
+        for interface in live.get("interfaces", []):
+            device = interface.get("host_dev")
+            if device and (Path("/sys/class/net") / device / "address").is_file():
+                tap_mac = (Path("/sys/class/net") / device / "address").read_text().strip()
+                print(f"TAP хоста {device}: {tap_mac} (MAC гостя указан в таблице)")
+    if netbox_error:
+        print(f"NetBox: {netbox_error}")
+    if pending:
+        print("Ожидают перезапуска: " + ", ".join(pending))
+    if netbox_diffs:
+        print("Расхождение NetBox: " + ", ".join(netbox_diffs))
+    if not netbox_error and not netbox_diffs and not pending:
+        print("Состояния согласованы" if desired else "Локальные данные показаны")
+    return 1 if netbox_error or netbox_diffs else 0
 
 
 def reconcile_power(config: dict, record: dict, desired_status: str) -> None:
@@ -1060,7 +1120,8 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                 return create_vm(plan, config, Path(__file__).parent, args.dry_run)
             if args.dry_run:
                 print(f"NetBox: create planned VM {request_vm['name']} on device {config['netbox']['device']}")
-                print(f"NetBox: create virtual disk, interface {request_vm.get('interface_name', 'inet')} and primary MAC")
+                print(f"NetBox: create virtual disk, interface "
+                      f"{host_interface_name(request_vm['name'], request_vm.get('interface_name', 'inet'))} and primary MAC")
                 if request_vm["source"] == "iso":
                     print(f"NetBox: create Virtual Disk media-sda for ISO {request_vm['iso']}")
                 if args.command == "prepare":
