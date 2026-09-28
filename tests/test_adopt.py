@@ -126,13 +126,53 @@ class AdoptReconcileTests(unittest.TestCase):
         ips.assert_not_called()
         self.assertFalse(any(item[0] == "add" and item[1] == "nic" for item in calls))
 
+    def test_adopt_reuses_single_ip_interface_without_matching_name_or_mac(self):
+        nic = {"id": 8, "name": "enp1s0", "primary_mac_address": None}
+        calls = []
+        with (patch("netbox.vm_disks", return_value=[]),
+              patch("netbox.vm_interfaces", return_value=[nic]),
+              patch("netbox.interface_ips", return_value=[{"id": 7}]) as ips,
+              patch("netbox.interface_macs", return_value=[]),
+              patch("netbox.patch_vm"),
+              patch("netbox._request", side_effect=lambda *args: calls.append((args[1], args[2], args[3])) or {"id": 9}),
+              patch("netbox.add_component", side_effect=lambda *args: {"id": 10}),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertTrue(netbox.reconcile_adopted_vm({}, RECORD, LOCAL, False))
+        tap = host_interface_name("guest", "inet")
+        self.assertIn(("PATCH", "virtualization/interfaces/8/", {"name": tap}), calls)
+        self.assertIn(("POST", "dcim/mac-addresses/", {
+            "mac_address": "52:54:00:00:00:01",
+            "assigned_object_type": "virtualization.vminterface", "assigned_object_id": 8,
+        }), calls)
+        self.assertFalse(any(method == "DELETE" and "interfaces/8/" in path for method, path, _ in calls))
+        ips.assert_not_called()
+        self.assertIn("IP stays assigned; MAC follows local VM", output.getvalue())
+
+    def test_adopt_reuses_assigned_nonprimary_mac_on_ip_interface(self):
+        nic = {"id": 8, "name": "enp1s0", "primary_mac_address": None}
+        calls = []
+        with (patch("netbox.vm_disks", return_value=[]),
+              patch("netbox.vm_interfaces", return_value=[nic]),
+              patch("netbox.interface_ips", return_value=[{"id": 7}]) as ips,
+              patch("netbox.interface_macs", return_value=[{
+                  "id": 9, "mac_address": "52:54:00:00:00:99"}]),
+              patch("netbox.patch_vm"),
+              patch("netbox._request", side_effect=lambda *args: calls.append((args[1], args[2], args[3])) or {}),
+              patch("netbox.add_component", return_value={"id": 10}),
+              redirect_stdout(io.StringIO())):
+            netbox.reconcile_adopted_vm({}, RECORD, LOCAL, False)
+        self.assertIn(("PATCH", "dcim/mac-addresses/9/", {"mac_address": "52:54:00:00:00:01"}), calls)
+        self.assertIn(("PATCH", "virtualization/interfaces/8/", {"primary_mac_address": 9}), calls)
+        self.assertFalse(any(method == "POST" and path == "virtualization/interfaces/" for method, path, _ in calls))
+        ips.assert_not_called()
+
     def test_stale_interface_with_ip_blocks_all_writes(self):
         stale = {"id": 8, "name": "old", "primary_mac_address": None}
         with patch("netbox.vm_disks", return_value=[]), \
              patch("netbox.vm_interfaces", return_value=[stale]), \
              patch("netbox.interface_ips", return_value=[{"id": 7}]), \
              patch("netbox.patch_vm") as update:
-            with self.assertRaisesRegex(netbox.NetBoxError, "has IP addresses"):
+            with self.assertRaisesRegex(netbox.NetBoxError, "cannot match NetBox interface old with IP addresses"):
                 netbox.reconcile_adopted_vm({}, RECORD, {**LOCAL, "interfaces": []}, False)
         update.assert_not_called()
 

@@ -486,12 +486,30 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
         if match:
             used_nics.add(match["id"])
         nic_plan.append((local, match, name))
+    unmatched_local = [index for index, (_, match, _) in enumerate(nic_plan) if match is None]
+    unmatched_netbox = [item for item in interfaces if item["id"] not in used_nics]
+    if len(unmatched_local) == len(unmatched_netbox) == 1:
+        index = unmatched_local[0]
+        local, _, name = nic_plan[index]
+        match = unmatched_netbox[0]
+        nic_plan[index] = (local, match, name)
+        used_nics.add(match["id"])
     stale_nics = [item for item in interfaces if item["id"] not in used_nics]
     if len({name for _, _, name in nic_plan}) != len(nic_plan):
         raise NetBoxError(f"VM {vm['name']}: duplicate host TAP interface names")
     for item in stale_nics:
         if interface_ips(config, item["id"]):
-            raise NetBoxError(f"VM {vm['name']}: interface {item['name']} has IP addresses; unassign them in NetBox before adoption")
+            raise NetBoxError(f"VM {vm['name']}: cannot match NetBox interface {item['name']} with IP addresses "
+                              "to a local NIC; set its Primary MAC to the guest MAC, or unassign IPs "
+                              "if the interface is obsolete")
+    assigned_macs = {}
+    for _, match, _ in nic_plan:
+        if match and not match.get("primary_mac_address"):
+            macs = interface_macs(config, match["id"])
+            if len(macs) > 1:
+                raise NetBoxError(f"VM {vm['name']}: interface {match['name']} has multiple MAC objects; "
+                                  "select one Primary MAC in NetBox before adoption")
+            assigned_macs[match["id"]] = macs
 
     new_context = {**context, "version": 3, "source": "existing",
                    "bridge": local_interfaces[0]["bridge"] if local_interfaces else None,
@@ -543,7 +561,7 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
         print(f"  REMOVE Virtual Disk {item['name']}")
     for _, match, name in nic_changes:
         if match and match["name"] != name:
-            print(f"  RENAME VM Interface {match['name']} → {name} (IP and MAC stay assigned)")
+            print(f"  RENAME VM Interface {match['name']} → {name} (IP stays assigned; MAC follows local VM)")
     if dry_run:
         return True
     if changes:
@@ -565,6 +583,13 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
         primary = match.get("primary_mac_address")
         if primary and primary.get("mac_address", "").lower() != local["mac_address"].lower():
             _request(config, "PATCH", f"dcim/mac-addresses/{primary['id']}/", {"mac_address": local["mac_address"]})
+        elif not primary and assigned_macs.get(match["id"]):
+            assigned = assigned_macs[match["id"]][0]
+            if assigned["mac_address"].lower() != local["mac_address"].lower():
+                _request(config, "PATCH", f"dcim/mac-addresses/{assigned['id']}/",
+                         {"mac_address": local["mac_address"]})
+            _request(config, "PATCH", f"virtualization/interfaces/{match['id']}/",
+                     {"primary_mac_address": assigned["id"]})
         else:
             ensure_primary_mac(config, match, local["mac_address"])
     for item in stale_nics:
@@ -631,17 +656,18 @@ def patch_vm(config: dict, vm_id: int, changes: dict) -> dict:
 
 
 def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
+    context_data = record.get("local_context_data") or {}
+    context = context_data.get("vmctl") if isinstance(context_data, dict) else None
+    if not isinstance(context, dict) or context.get("version") not in (1, 2, 3):
+        raise NetBoxError("NetBox VM has no supported vmctl context; run vmctl adopt to import the local VM")
     try:
         memory = int(record["memory"])
         vcpus_value = Decimal(str(record["vcpus"]))
         vcpus = int(vcpus_value)
         disk_mb = int(record["disk"])
         name = record["name"]
-        context = record["local_context_data"]["vmctl"]
     except (KeyError, TypeError, ValueError, InvalidOperation) as error:
         raise NetBoxError("NetBox VM lacks name, vCPUs, memory or disk") from error
-    if not isinstance(context, dict) or context.get("version") not in (1, 2, 3):
-        raise NetBoxError("NetBox VM has no supported vmctl context")
     if disk_mb < 0 or memory <= 0 or vcpus <= 0 or vcpus_value != vcpus:
         raise NetBoxError("NetBox VM sizing must be valid")
     result = {
