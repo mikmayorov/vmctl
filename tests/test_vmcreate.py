@@ -13,11 +13,30 @@ from unittest.mock import patch
 import netbox
 import inventory
 import vmctl
-from vmctl import load_config
+from vmctl import load_config, resolve_creation_spec
 from vmcreate import create_vm, domain_xml, validate_spec, verify_local_vm
 
 
 class CreationTests(unittest.TestCase):
+    def test_hardware_profile_supplies_creation_resources(self):
+        config = {"hardware": {"small": {"vcpus": 2, "memory_mb": 2048, "disk_gb": 20}}}
+        request = {"vm": {"name": "guest", "hardware": "small", "source": "iso", "iso": "/iso/install.iso"}}
+        resolved = resolve_creation_spec(request, config)
+        self.assertEqual((resolved["vcpus"], resolved["memory_mb"], resolved["disk_gb"]), (2, 2048, 20))
+
+    def test_hardware_profile_rejects_ambiguous_resource_override(self):
+        config = {"hardware": {"small": {"vcpus": 2, "memory_mb": 2048, "disk_gb": 20}}}
+        request = {"vm": {"name": "guest", "hardware": "small", "vcpus": 4,
+                          "source": "iso", "iso": "/iso/install.iso"}}
+        with self.assertRaisesRegex(ValueError, "vm.hardware supplies vcpus"):
+            resolve_creation_spec(request, config)
+
+    def test_software_profile_is_reserved(self):
+        request = {"vm": {"name": "guest", "software": "ubuntu", "source": "iso",
+                          "iso": "/iso/install.iso", "vcpus": 2, "memory_mb": 2048, "disk_gb": 20}}
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            resolve_creation_spec(request, {})
+
     def test_vmctl_entrypoint_runs_through_installed_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             link = Path(directory) / "vmctl"
@@ -112,13 +131,52 @@ class CreationTests(unittest.TestCase):
                 return SimpleNamespace(stdout="Capacity: 21474836480\n")
             if "domstate" in args:
                 return SimpleNamespace(stdout="running\n")
+            if "vcpucount" in args:
+                return SimpleNamespace(stdout="3\n")
+            if "dommemstat" in args:
+                return SimpleNamespace(stdout="actual 1048576\n")
             return SimpleNamespace(stdout="Autostart: enable\n")
         with patch("inventory.subprocess.run", side_effect=command):
             observed = inventory.inspect_vm({"host": {"libvirt_uri": "qemu:///system"}}, "test-vm")
         self.assertEqual(observed["disk_mb"], 20480)
         self.assertEqual(observed["mounted_media"], [{"path": "/images/installer.iso", "target": "sda", "size_mb": 20480}])
         self.assertEqual(observed["status"], "active")
+        self.assertEqual(observed["vcpus"], 3)
+        self.assertEqual(observed["memory_bytes"], 1024 * 1024**2)
         self.assertTrue(observed["autostart"])
+
+    def test_persistent_definition_uses_current_memory_and_cpu(self):
+        xml = """<domain><name>guest</name><memory unit="MiB">4096</memory>
+        <currentMemory unit="MiB">3072</currentMemory><vcpu current="3">4</vcpu>
+        <devices><disk device="disk"><source file="/disk.qcow2"/><target dev="vda"/></disk>
+        <interface type="bridge"><source bridge="br0"/><mac address="52:54:00:00:00:01"/>
+        <target dev="vm-guest-123456"/></interface></devices></domain>"""
+        with patch("inventory._virsh", return_value=xml) as virsh:
+            observed = inventory.inspect_definition({"host": {"libvirt_uri": "qemu:///system"}}, "guest")
+        self.assertEqual((observed["memory_mb"], observed["vcpus"]), (3072, 3))
+        self.assertEqual(observed["disks"], [{"target": "vda", "path": "/disk.qcow2"}])
+        self.assertIn("--inactive", virsh.call_args.args)
+
+    def test_persistent_definition_ignores_empty_cdrom(self):
+        xml = """<domain><memory unit="MiB">2048</memory><vcpu>2</vcpu><devices>
+        <disk device="cdrom"><target dev="sda"/></disk></devices></domain>"""
+        with patch("inventory._virsh", return_value=xml):
+            observed = inventory.inspect_definition({"host": {"libvirt_uri": "qemu:///system"}}, "guest")
+        self.assertEqual(observed["mounted_media"], [])
+
+    def test_stopped_inventory_uses_startup_cpu_and_memory(self):
+        xml = """<domain><memory unit="MiB">4096</memory>
+        <currentMemory unit="MiB">3072</currentMemory><vcpu current="3">4</vcpu>
+        <devices/></domain>"""
+        def command(*args):
+            if "dumpxml" in args:
+                return xml
+            if "domstate" in args:
+                return "shut off"
+            return "Autostart: disable"
+        with patch("inventory._virsh", side_effect=command):
+            observed = inventory.inspect_vm({"host": {"libvirt_uri": "qemu:///system"}}, "guest")
+        self.assertEqual((observed["vcpus"], observed["memory_mb"]), (3, 3072))
 
 
 class NetBoxTests(unittest.TestCase):

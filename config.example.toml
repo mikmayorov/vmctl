@@ -11,6 +11,21 @@ directory = "/var/lib/libvirt/images"
 # Default for a new request; each VM's selected bridge is stored in NetBox.
 bridge = "br0" # Replace with a bridge that exists on this host.
 
+[hardware.small]
+vcpus = 2
+memory_mb = 2048
+disk_gb = 20
+
+[hardware.medium]
+vcpus = 4
+memory_mb = 4096
+disk_gb = 40
+
+[hardware.large]
+vcpus = 8
+memory_mb = 8192
+disk_gb = 80
+
 [netbox]
 url = "https://netbox.example.org" # Replace when NetBox mode is enabled.
 key = "" # Optional: leave empty when using netbox.key file or NETBOX_TOKEN.

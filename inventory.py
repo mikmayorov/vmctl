@@ -32,10 +32,54 @@ def inspect_display(config: dict, name: str) -> dict:
     return result
 
 
+def inspect_definition(config: dict, name: str, inactive: bool = True) -> dict:
+    """Read the persistent or live XML definition without consulting NetBox."""
+    arguments = ("dumpxml", *(["--inactive"] if inactive else []), "--security-info", name)
+    root = ET.fromstring(_virsh(config, *arguments))
+    memory = root.find("./currentMemory")
+    if memory is None:
+        memory = root.find("./memory")
+    vcpu = root.find("./vcpu")
+    units = {"KiB": 1 / 1024, "MiB": 1, "GiB": 1024}
+    if memory is None or memory.text is None or vcpu is None or vcpu.text is None:
+        raise ValueError(f"VM {name}: XML lacks memory or vCPU count")
+    memory_mb = int(int(memory.text) * units[memory.get("unit", "KiB")])
+    disks = []
+    media = []
+    for node in root.findall("./devices/disk"):
+        source, target = node.find("source"), node.find("target")
+        path = (source.get("file") or source.get("dev")) if source is not None else None
+        item = {"target": target.get("dev") if target is not None else None, "path": path}
+        if node.get("device") == "disk":
+            disks.append(item)
+        elif node.get("device") == "cdrom" and path:
+            media.append(item)
+    interfaces = []
+    for node in root.findall("./devices/interface"):
+        source, mac, target = node.find("source"), node.find("mac"), node.find("target")
+        interfaces.append({"bridge": source.get("bridge") if source is not None else None,
+                           "mac_address": mac.get("address") if mac is not None else None,
+                           "host_dev": target.get("dev") if target is not None else None})
+    graphics = root.find("./devices/graphics")
+    listener = graphics.find("./listen[@type='address']") if graphics is not None else None
+    display = {"type": "none"} if graphics is None else {
+        "type": graphics.get("type"), "listen": graphics.get("listen") or
+                (listener.get("address") if listener is not None else None),
+        "port": "auto" if graphics.get("autoport") == "yes" and inactive else
+                int(graphics.get("port", "-1")),
+        "password": graphics.get("passwd"),
+    }
+    return {"uuid": root.findtext("./uuid"), "vcpus": int(vcpu.get("current") or vcpu.text),
+            "memory_mb": memory_mb, "description": root.findtext("./description") or "",
+            "disks": disks, "mounted_media": media, "interfaces": interfaces,
+            "display": display}
+
+
 def inspect_vm(config: dict, name: str) -> dict:
     root = ET.fromstring(_virsh(config, "dumpxml", "--security-info", name))
     memory = root.find("./memory")
-    vcpu = root.findtext("./vcpu")
+    vcpu_node = root.find("./vcpu")
+    vcpu = (vcpu_node.get("current") or vcpu_node.text) if vcpu_node is not None else None
     units = {"KiB": 1 / 1024, "MiB": 1, "GiB": 1024}
     if memory is None or memory.text is None or memory.get("unit", "KiB") not in units or not vcpu:
         raise ValueError(f"VM {name}: cannot read memory or vCPU count")
@@ -105,13 +149,34 @@ def inspect_vm(config: dict, name: str) -> dict:
     state = _virsh(config, "domstate", name)
     if state not in ("running", "shut off"):
         raise ValueError(f"VM {name}: unsupported power state {state!r}")
+    if state == "shut off":
+        startup_memory = root.find("./currentMemory")
+        if startup_memory is not None and startup_memory.text is not None:
+            memory_mb = int(int(startup_memory.text) * units[startup_memory.get("unit", "KiB")])
     dominfo = _virsh(config, "dominfo", name)
     autostart = next((line.split(":", 1)[1].strip().lower() for line in dominfo.splitlines()
                       if line.startswith("Autostart:")), "")
     if autostart not in ("enable", "disable"):
         raise ValueError(f"VM {name}: cannot read autostart state")
+    memory_bytes = memory_mb * 1024**2
+    current_vcpus = int(vcpu)
+    if state == "running":
+        current_vcpus = int(_virsh(config, "vcpucount", "--active", "--live", name))
+        stats = _virsh(config, "dommemstat", name)
+        actual = next((line.split()[1] for line in stats.splitlines()
+                       if line.split()[:1] == ["actual"] and len(line.split()) > 1), None)
+        if actual is None:
+            used = next((line.split(":", 1)[1].strip().split()[0] for line in dominfo.splitlines()
+                         if line.startswith("Used memory:")), None)
+            actual = used
+        if actual is None or not actual.isdecimal():
+            raise ValueError(f"VM {name}: cannot read current assigned memory")
+        memory_bytes = int(actual) * 1024
+        memory_mb = (memory_bytes + 1024**2 - 1) // 1024**2
     return {
-        "name": name, "uuid": root.findtext("./uuid"), "vcpus": int(vcpu), "memory_mb": memory_mb,
+        "name": name, "uuid": root.findtext("./uuid"), "vcpus": current_vcpus,
+        "description": root.findtext("./description") or "",
+        "memory_mb": memory_mb, "memory_bytes": memory_bytes,
         "disk_mb": sum(item["size_mb"] for item in disk_items),
         "disk_paths": disk_paths,
         "disks": disk_items,

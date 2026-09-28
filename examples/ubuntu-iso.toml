@@ -2,7 +2,5 @@
 name = "example-ubuntu"
 description = "Example Ubuntu VM"
 source = "iso"
-memory_mb = 2048
-vcpus = 2
-disk_gb = 20
+hardware = "small"
 iso = "/var/lib/libvirt/images/iso/installer.iso" # Replace with an ISO on this host.
