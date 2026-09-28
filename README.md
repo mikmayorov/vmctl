@@ -227,10 +227,17 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 | Автозапуск | `Start on boot` ВМ | Меняйте через `autostart`/`autostart-off`; обычный `sync` автозапуск не переключает. |
 | Диски и ISO | `Virtual Disks`: `Size` в МиБ, полный путь в `Description` | `adopt` переносит оба вида носителей. Размер ISO входит в общий Disk ВМ. `sync` не меняет размер существующего qcow2 и пока не переподключает импортированные ISO. |
 | Интерфейсы и MAC | `VM Interfaces` и Primary MAC | Имя созданного `vmctl` VM Interface совпадает с именем TAP на хосте (`vm-...`). Primary MAC — адрес **гостевого** адаптера; MAC TAP, видимый как `link/ether` на хосте, может отличаться. `sync` применяет значения к постоянному XML; работающей ВМ нужен следующий запуск. |
-
-Разные MAC гостевого адаптера и TAP — штатное поведение libvirt: одинаковые адреса на двух концах TAP мешали бы L2-передаче. `vmctl check ИМЯ` показывает оба адреса с подписями. [Обсуждение в проекте libvirt](https://lists.libvirt.org/archives/list/devel%40lists.libvirt.org/thread/IYBXRAMRWTCDKV23MJQPONKPLOFCBM5F/).
 | IPv4/IPv6 | IPAM: адрес на интерфейсе, затем Primary IP ВМ при необходимости | Адрес назначает администратор вручную. `vmctl` читает и проверяет привязку; сеть гостя не настраивает. |
 | Мост, источник установки, пути, дисплей | `local_context_data.vmctl` ВМ | `sync` строит постоянную конфигурацию. Для нового запроса значения по умолчанию берутся из `config.toml`. |
+
+У одного подключения два MAC-адреса:
+
+```text
+guest NIC: 52:54:00:a8:0d:88  — адаптер внутри ВМ; этот MAC хранится в NetBox VM Interface
+host NIC:  fe:54:00:a8:0d:88  — TAP на хосте; его показывает ip link show dev vm-...
+```
+
+libvirt задаёт TAP другой первый байт (`fe` вместо `52`), чтобы у двух сторон не было одинакового MAC и не нарушалась передача кадров. Имя TAP при этом совпадает с именем VM Interface в NetBox. `vmctl check ИМЯ` показывает MAC гостя в таблице и MAC хостового TAP отдельно. [Объяснение разработчика libvirt](https://lists.libvirt.org/archives/list/devel%40lists.libvirt.org/thread/IYBXRAMRWTCDKV23MJQPONKPLOFCBM5F/).
 
 `local_context_data.vmctl.display` задаёт `type` (`vnc`, `spice`, `none`), `listen` (IP **хоста**), `port` (`"auto"` или 5900–65535), `password`. Пример: `{"type":"vnc","listen":"127.0.0.1","port":"auto"}`. На внешнем адресе пароль обязателен; VNC использует максимум 8 байт пароля. Для удалённого доступа удобно оставить loopback и открыть SSH-туннель. Пароль хранится в NetBox и XML libvirt открытым текстом; `check guest` тоже его показывает. Ограничивайте права чтения. Меняйте объект `vmctl.display`, сохраняя остальные поля `vmctl`; затем выполните `vmctl --dry-run sync guest` и `vmctl sync guest`. Работающей ВМ нужен следующий запуск.
 
