@@ -52,11 +52,12 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(check_vm(CONFIG, "guest"), 0)
         report = output.getvalue()
         self.assertIn("NetBox", report)
-        self.assertIn("XML (следующий запуск)", report)
+        self.assertIn("XML/libvirt (следующий запуск)", report)
         self.assertIn("Mem (сейчас)", report)
         self.assertIn("NIC guest:              52:54:00:00:00:01", report)
         self.assertIn("NIC host:               vm-guest-123456 / master br0", report)
         self.assertIn("vnet11 / master br0", report)
+        self.assertRegex(report, r"Автозапуск\s+да\s+да\s+—")
         self.assertIn("Ожидают перезапуска: CPU/RAM/HDD, NIC host:", report)
         self.assertNotIn("Расхождение NetBox", report)
 

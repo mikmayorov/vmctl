@@ -923,7 +923,7 @@ def _check_table(rows: list[tuple[str, str, str, str, bool]]) -> None:
     label_width = 24
     def chunks(value: str) -> list[str]:
         return textwrap.wrap(value, width=width, break_long_words=True, break_on_hyphens=False) or [""]
-    print(f"{'Параметр':<{label_width}}  {'NetBox':<{width}}  {'XML (следующий запуск)':<{width}}  Mem (сейчас)")
+    print(f"{'Параметр':<{label_width}}  {'NetBox':<{width}}  {'XML/libvirt (следующий запуск)':<{width}}  Mem (сейчас)")
     print("─" * (label_width + 3 * width + 6))
     for label, desired, xml, live, different in rows:
         cells = [chunks(value) for value in (desired, xml, live)]
@@ -1012,7 +1012,7 @@ def check_vm(config: dict, name: str) -> int:
         elif label == "Питание":
             expected, defined, current = desired.get("status") if desired else None, None, local["status"]
         elif label == "Автозапуск":
-            expected, defined, current = desired.get("autostart") if desired else None, None, local["autostart"]
+            expected, defined, current = desired.get("autostart") if desired else None, local["autostart"], None
         elif label == "Description":
             expected, defined, current = (view.get("description") if view else None for view in (desired, persistent, live))
         else:
@@ -1020,7 +1020,7 @@ def check_vm(config: dict, name: str) -> int:
                 return (_check_value(view, "Диски"), _check_value(view, "ISO")) if view else None
             expected, defined, current = (paths(view) for view in (desired, persistent, live))
         nb_diff = desired is not None and expected is not None and (
-            expected != current if label in ("Питание", "Автозапуск") else expected != defined)
+            expected != current if label == "Питание" else expected != defined)
         if label == "Питание" and expected not in ("active", "offline"):
             nb_diff = False
         xml_diff = live is not None and label not in ("Питание", "Автозапуск") and defined != current
@@ -1028,11 +1028,14 @@ def check_vm(config: dict, name: str) -> int:
             netbox_diffs.append(label)
         if xml_diff:
             pending.append(label)
-        netbox_value = _check_column(desired, label) if label not in ("Питание", "Автозапуск") else (
-            _check_column(desired, label) if desired else "—")
-        xml_value = _check_column(xml_view, label, local_sizes, host_names=True) if label not in ("Питание", "Автозапуск") else "—"
-        mem_value = (_check_column(live, label, host_names=True) if live else "—") if label not in ("Питание", "Автозапуск") else (
-            _check_column(local, label))
+        netbox_value = _check_column(desired, label)
+        if label == "Питание":
+            xml_value, mem_value = "—", _check_column(local, label)
+        elif label == "Автозапуск":
+            xml_value, mem_value = _check_column(local, label), "—"
+        else:
+            xml_value = _check_column(xml_view, label, local_sizes, host_names=True)
+            mem_value = _check_column(live, label, host_names=True)
         rows.append((label, netbox_value, xml_value, mem_value, nb_diff or xml_diff))
 
     print(f"ВМ: {name}")
