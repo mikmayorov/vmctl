@@ -890,10 +890,10 @@ def _check_column(view: dict | None, field: str, disk_sizes: dict[str, int] | No
                  or (disk_sizes or {}).get(item.get("path")) for item in view.get("disks", [])]
         disk = f"{sum(sizes)} MiB" if sizes and all(size is not None for size in sizes) else "? MiB"
         return f"{view.get('vcpus', '?')} / {view.get('memory_mb', '?')} MiB / {disk}"
-    if field == "NIC guest:":
+    if field == "NIC guest":
         interfaces = view.get("interfaces", [])
         return "; ".join((item.get("mac_address") or "?").lower() for item in interfaces) or "—"
-    if field == "NIC host:":
+    if field == "NIC host":
         interfaces = view.get("interfaces", [])
         return "; ".join(f"{(item.get('host_dev') if host_names else item.get('name')) or '?'} / "
                          f"master {item.get('master', item.get('bridge')) or '?'}"
@@ -990,7 +990,7 @@ def check_vm(config: dict, name: str) -> int:
     def nics(view: dict | None, field: str, key: str):
         if view is None:
             return None
-        if field == "NIC guest:":
+        if field == "NIC guest":
             return tuple(sorted((item.get("mac_address") or "").lower()
                                 for item in view.get("interfaces", [])))
         return tuple(sorted((item.get(key), item.get("master", item.get("bridge")))
@@ -999,7 +999,7 @@ def check_vm(config: dict, name: str) -> int:
     rows = []
     netbox_diffs = []
     pending = []
-    for label in ("UUID", "CPU/RAM/HDD", "NIC guest:", "NIC host:", "Primary IPv4", "Primary IPv6",
+    for label in ("UUID", "CPU/RAM/HDD", "NIC guest", "NIC host", "Primary IPv4", "Primary IPv6",
                   "Дисплей URL/Password",
                   "Питание", "Автозапуск", "Description", "Носители"):
         if label in ("Primary IPv4", "Primary IPv6"):
@@ -1011,7 +1011,7 @@ def check_vm(config: dict, name: str) -> int:
             expected, defined, current = (view.get("uuid") if view else None for view in (desired, persistent, live))
         elif label == "CPU/RAM/HDD":
             expected, defined, current = (cpu_ram_disk(view) for view in (desired, xml_view, live))
-        elif label in ("NIC guest:", "NIC host:"):
+        elif label in ("NIC guest", "NIC host"):
             expected = nics(desired, label, "name")
             defined = nics(persistent, label, "host_dev")
             current = nics(live, label, "host_dev")
