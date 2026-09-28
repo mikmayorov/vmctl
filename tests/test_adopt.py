@@ -28,7 +28,8 @@ class AdoptReconcileTests(unittest.TestCase):
     def test_interface_only_migration_preserves_other_netbox_state(self):
         tap = host_interface_name("guest", "inet")
         record = {"id": 42, "name": "guest", "local_context_data": {"vmctl": {
-            "source": "existing", "display": {"type": "vnc", "listen": "192.0.2.10", "port": 5901},
+            "version": 3, "source": "existing",
+            "display": {"type": "vnc", "listen": "192.0.2.10", "port": 5901},
             "interface_name": "inet", "interface_bridges": {"inet": "br0"}}}}
         vm = {"name": "guest", "interfaces": [{"name": "inet", "host_dev": tap,
               "bridge": "br0", "mac_address": "52:54:00:00:00:01"}]}
@@ -40,9 +41,10 @@ class AdoptReconcileTests(unittest.TestCase):
             self.assertTrue(netbox.normalize_vm_interface_names({}, record, vm, False))
         data = update.call_args.args[2]["local_context_data"]["vmctl"]
         self.assertEqual(data["display"], record["local_context_data"]["vmctl"]["display"])
-        self.assertEqual(data["interface_bridges"], {tap: "br0"})
-        self.assertEqual(data["interface_name"], tap)
-        request.assert_called_once_with({}, "PATCH", "virtualization/interfaces/8/", {"name": tap})
+        self.assertEqual(data["version"], 4)
+        self.assertEqual(data["interfaces"], {"inet": {"host_dev": tap, "bridge": "br0"}})
+        self.assertNotIn("interface_bridges", data)
+        request.assert_not_called()
 
     def test_netbox_spec_excludes_iso_from_libvirt_writable_disks(self):
         record = {**RECORD, "serial": UUID, "disk": 21504,
@@ -114,9 +116,11 @@ class AdoptReconcileTests(unittest.TestCase):
         self.assertEqual((vm_changes["vcpus"], vm_changes["memory"]), (4, 4096))
         self.assertEqual(vm_changes["local_context_data"]["vmctl"]["mounted_media"],
                          [{"name": "media-sda", "target": "sda"}])
-        tap = host_interface_name("guest", "inet")
-        self.assertEqual(vm_changes["local_context_data"]["vmctl"]["interface_bridges"], {tap: "br0"})
-        self.assertIn(("PATCH", "virtualization/interfaces/8/", {"name": tap}), calls)
+        tap = host_interface_name("guest", "public")
+        self.assertEqual(vm_changes["local_context_data"]["vmctl"]["interfaces"],
+                         {"public": {"host_dev": tap, "bridge": "br0"}})
+        self.assertFalse(any(item[0] == "PATCH" and item[1] == "virtualization/interfaces/8/"
+                             and "name" in item[2] for item in calls))
         self.assertIn(("PATCH", "virtualization/virtual-disks/5/",
                        {"size": 20480, "description": "/images/guest.qcow2"}), calls)
         self.assertIn(("add", "disk", {"virtual_machine": 42, "name": "disk-vdb", "size": 5121,
@@ -133,20 +137,21 @@ class AdoptReconcileTests(unittest.TestCase):
               patch("netbox.vm_interfaces", return_value=[nic]),
               patch("netbox.interface_ips", return_value=[{"id": 7}]) as ips,
               patch("netbox.interface_macs", return_value=[]),
-              patch("netbox.patch_vm"),
+              patch("netbox.patch_vm") as update,
               patch("netbox._request", side_effect=lambda *args: calls.append((args[1], args[2], args[3])) or {"id": 9}),
               patch("netbox.add_component", side_effect=lambda *args: {"id": 10}),
               redirect_stdout(io.StringIO()) as output):
             self.assertTrue(netbox.reconcile_adopted_vm({}, RECORD, LOCAL, False))
-        tap = host_interface_name("guest", "inet")
-        self.assertIn(("PATCH", "virtualization/interfaces/8/", {"name": tap}), calls)
+        tap = host_interface_name("guest", "enp1s0")
+        self.assertEqual(update.call_args.args[2]["local_context_data"]["vmctl"]["interfaces"],
+                         {"enp1s0": {"host_dev": tap, "bridge": "br0"}})
         self.assertIn(("POST", "dcim/mac-addresses/", {
             "mac_address": "52:54:00:00:00:01",
             "assigned_object_type": "virtualization.vminterface", "assigned_object_id": 8,
         }), calls)
         self.assertFalse(any(method == "DELETE" and "interfaces/8/" in path for method, path, _ in calls))
         ips.assert_not_called()
-        self.assertIn("IP stays assigned; MAC follows local VM", output.getvalue())
+        self.assertIn("KEEP VM Interface enp1s0", output.getvalue())
 
     def test_adopt_reuses_assigned_nonprimary_mac_on_ip_interface(self):
         nic = {"id": 8, "name": "enp1s0", "primary_mac_address": None}

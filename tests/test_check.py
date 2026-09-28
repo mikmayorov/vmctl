@@ -44,7 +44,7 @@ class CheckTests(unittest.TestCase):
                                 "host_dev": "vnet11"}]}
         desired = {**persistent,
                    "disks": [{"name": "guest", "path": "/disk.qcow2", "size_mb": 10240}],
-                   "interfaces": [{"name": "vm-guest-123456", "bridge": "br0",
+                   "interfaces": [{"name": "eth0", "host_dev": "vm-guest-123456", "bridge": "br0",
                                    "mac_address": "52:54:00:00:00:01"}]}
         record = {"name": "guest", "status": {"value": "active"},
                   "start_on_boot": {"value": "on"},

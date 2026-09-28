@@ -250,9 +250,10 @@ class NetBoxTests(unittest.TestCase):
             "name": "test-vm", "serial": serial, "cluster": 7, "device": 12, "status": "planned", "start_on_boot": "off",
             "vcpus": 2, "memory": 2048, "disk": 20480, "description": "",
             "local_context_data": {"vmctl": {
-                "version": 3, "source": "iso", "iso": "/images/installer.iso",
-                "image": None, "user_data": None, "bridge": "br1",
-                "storage_directory": "/images", "interface_name": host_interface_name("test-vm", "inet"),
+                "version": 4, "source": "iso", "iso": "/images/installer.iso",
+                "image": None, "user_data": None,
+                "storage_directory": "/images", "interfaces": {
+                    "eth0": {"host_dev": host_interface_name("test-vm", "eth0"), "bridge": "br1"}},
                 "mounted_media": [{"name": "media-sda", "target": "sda"}],
                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }},
@@ -290,6 +291,51 @@ class NetBoxTests(unittest.TestCase):
             vm = netbox.local_spec_from_netbox(record, {})
         self.assertEqual(vm["mac_address"], "52:54:00:12:34:56")
         self.assertEqual(vm["description"], "Service VM")
+
+    def test_context_maps_guest_interface_to_host_tap_and_bridge(self):
+        tap = host_interface_name("test-vm", "enp1s0")
+        record = {
+            "id": 42, "name": "test-vm", "vcpus": 2, "memory": 2048, "disk": 20480,
+            "serial": "00000000-0000-4000-8000-000000000002",
+            "primary_ip4": {"id": 71},
+            "local_context_data": {"vmctl": {
+                "version": 4, "source": "existing",
+                "interfaces": {"enp1s0": {"host_dev": tap, "bridge": "br1"}},
+                "display": {"type": "none"},
+            }},
+        }
+        with (patch("netbox.vm_interfaces", return_value=[{
+                  "id": 8, "name": "enp1s0",
+                  "primary_mac_address": {"mac_address": "52:54:00:12:34:56"}}]),
+              patch("netbox.vm_disks", return_value=[{
+                  "name": "test-vm", "size": 20480, "description": "/images/test-vm.qcow2"}]),
+              patch("netbox.interface_ips", return_value=[{"id": 71}])):
+            spec = netbox.local_spec_from_netbox(record, {"storage": {"directory": "/images"}})
+        self.assertEqual(spec["interfaces"], [{
+            "name": "enp1s0", "mac_address": "52:54:00:12:34:56",
+            "host_dev": tap, "bridge": "br1"}])
+        xml = ET.fromstring(domain_xml(spec, Path("/images/test-vm.qcow2"), "br1"))
+        self.assertEqual(xml.find("./devices/interface/target").get("dev"), tap)
+        self.assertEqual(xml.find("./devices/interface/source").get("bridge"), "br1")
+
+    def test_prepare_creates_guest_named_interface_for_context_v4(self):
+        record = {"id": 42, "name": "test-vm", "disk": 20480,
+                  "local_context_data": {"vmctl": {
+                      "version": 4, "source": "cloud_image",
+                      "interfaces": {"eth0": {
+                          "host_dev": host_interface_name("test-vm", "eth0"), "bridge": "br1"}}}}}
+        requests = []
+        def request(_config, method, path, payload=None):
+            requests.append((method, path, payload))
+            return {"id": 8, "name": "eth0"}
+        with (patch("netbox.vm_disks", return_value=[]),
+              patch("netbox.vm_interfaces", return_value=[]),
+              patch("netbox._request", side_effect=request),
+              patch("netbox.ensure_primary_mac") as mac):
+            netbox.create_vm_components({"storage": {"directory": "/images"}}, record, "eth0")
+        self.assertIn(("POST", "virtualization/interfaces/", {
+            "virtual_machine": 42, "name": "eth0", "enabled": True}), requests)
+        mac.assert_called_once()
 
     def test_components_are_created_before_local_vm(self):
         record = {"id": 42, "name": "test-vm", "disk": 20480}

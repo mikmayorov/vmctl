@@ -201,11 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна ВМ; без имени все ВМ устройства хоста в NetBox")
     sync.add_argument("--purge", action="store_true",
                       help="Удалить файлы управляемых дисков, уже исключённых из NetBox (без имени — у всех ВМ)")
-    adopt_cmd = add("adopt", "Перенести фактические параметры локальных ВМ в NetBox, включая имена TAP интерфейсов; без имени обработать все. Libvirt не меняется.",
+    adopt_cmd = add("adopt", "Перенести фактические параметры локальных ВМ в NetBox, включая связь гостевых NIC с TAP и мостами; без имени обработать все. Libvirt не меняется.",
                     "vmctl --dry-run adopt guest")
     adopt_cmd.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна локальная ВМ; без имени все ВМ хоста")
     adopt_cmd.add_argument("--interfaces-only", action="store_true",
-                           help="Переименовать только VM Interfaces по TAP хоста; прочие поля NetBox сохранить")
+                           help="Перенести в Context только имя TAP и мост для каждого VM Interface; остальные поля сохранить")
 
     disk = add("disk", "Добавить или удалить диск выключенной ВМ. При наличии ключа сначала меняет NetBox.",
                "vmctl disk add guest data --size-gb 20")
@@ -477,7 +477,8 @@ def component_command(config: dict, args: argparse.Namespace) -> int:
             raise NetBoxError("VM deletion is pending")
         items = vm_disks(config, record["id"]) if kind == "disk" else vm_interfaces(config, record["id"])
         found = next((item for item in items if item["name"] == component_name), None)
-        if kind == "nic" and found is None:
+        context = (record.get("local_context_data") or {}).get("vmctl") or {}
+        if kind == "nic" and found is None and context.get("version") != 4:
             component_name = host_interface_name(name, component_name)
             found = next((item for item in items if item["name"] == component_name), None)
         if kind == "disk" and action == "add" and not found:
@@ -511,7 +512,19 @@ def component_command(config: dict, args: argparse.Namespace) -> int:
                     found = add_component(config, "nic", {"virtual_machine": record["id"],
                                                           "name": component_name, "enabled": True})
                 ensure_primary_mac(config, found, mac)
-                if bridge:
+                if context.get("version") == 4:
+                    context_data = record.get("local_context_data") or {}
+                    context = dict(context)
+                    layout = dict(context.get("interfaces") or {})
+                    layout[component_name] = {
+                        "host_dev": layout.get(component_name, {}).get("host_dev") or
+                                    host_interface_name(name, component_name),
+                        "bridge": bridge or layout.get(component_name, {}).get("bridge") or
+                                  config["network"]["bridge"],
+                    }
+                    context["interfaces"] = layout
+                    patch_vm(config, record["id"], {"local_context_data": {**context_data, "vmctl": context}})
+                elif bridge:
                     context_data = record.get("local_context_data") or {}
                     context = dict(context_data.get("vmctl") or {})
                     bridges = dict(context.get("interface_bridges") or {})
@@ -532,7 +545,8 @@ def component_command(config: dict, args: argparse.Namespace) -> int:
                 remove_component(config, "nic", found["id"])
             context_data = record.get("local_context_data") or {}
             context = dict(context_data.get("vmctl") or {})
-            field = "disk_paths_by_name" if kind == "disk" else "interface_bridges"
+            field = "disk_paths_by_name" if kind == "disk" else (
+                "interfaces" if context.get("version") == 4 else "interface_bridges")
             mappings = dict(context.get(field) or {})
             if component_name in mappings:
                 del mappings[component_name]
@@ -685,13 +699,13 @@ def audit(config: dict) -> int:
             if status in ("active", "offline"):
                 expected["status"] = status
             context = (vm.get("local_context_data") or {}).get("vmctl") or {}
-            supported_context = context.get("version") in (1, 2, 3) and context.get("source") in ("iso", "cloud_image", "existing")
+            supported_context = context.get("version") in (1, 2, 3, 4) and context.get("source") in ("iso", "cloud_image", "existing")
             pending_restart = False
             if not supported_context:
                 print(f"INVALID {name}: NetBox VM has no supported vmctl context")
                 problems += 1
             else:
-                if context["version"] in (2, 3):
+                if context["version"] in (2, 3, 4):
                     try:
                         spec = local_spec_from_netbox(vm, config)
                         expected.update({field: spec[field] for field in ("description", "display")})
@@ -895,9 +909,11 @@ def _check_column(view: dict | None, field: str, disk_sizes: dict[str, int] | No
         return "; ".join((item.get("mac_address") or "?").lower() for item in interfaces) or "—"
     if field == "NIC host":
         interfaces = view.get("interfaces", [])
-        return "; ".join(f"{(item.get('host_dev') if host_names else item.get('name')) or '?'} / "
-                         f"master {item.get('master', item.get('bridge')) or '?'}"
-                         for item in interfaces) or "—"
+        return "; ".join(
+            f"{(item.get('host_dev') or (None if host_names else item.get('name'))) or '?'} / "
+            f"master {item.get('master', item.get('bridge')) or '?'}"
+            for item in interfaces
+        ) or "—"
     if field == "Дисплей URL/Password":
         display = view.get("display")
         if display is None:
@@ -1012,7 +1028,9 @@ def check_vm(config: dict, name: str) -> int:
         elif label == "CPU/RAM/HDD":
             expected, defined, current = (cpu_ram_disk(view) for view in (desired, xml_view, live))
         elif label in ("NIC guest", "NIC host"):
-            expected = nics(desired, label, "name")
+            desired_key = "host_dev" if label == "NIC host" and desired and all(
+                item.get("host_dev") for item in desired.get("interfaces", [])) else "name"
+            expected = nics(desired, label, desired_key)
             defined = nics(persistent, label, "host_dev")
             current = nics(live, label, "host_dev")
         elif label == "Дисплей URL/Password":
@@ -1168,8 +1186,10 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                 return create_vm(plan, config, Path(__file__).parent, args.dry_run)
             if args.dry_run:
                 print(f"NetBox: create planned VM {request_vm['name']} on device {config['netbox']['device']}")
-                print(f"NetBox: create virtual disk, interface "
-                      f"{host_interface_name(request_vm['name'], request_vm.get('interface_name', 'inet'))} and primary MAC")
+                guest_name = request_vm.get("interface_name", "eth0")
+                print(f"NetBox: create virtual disk, guest interface {guest_name} and primary MAC")
+                print(f"NetBox context: host TAP {host_interface_name(request_vm['name'], guest_name)} "
+                      f"on {config['network']['bridge']}")
                 if request_vm["source"] == "iso":
                     print(f"NetBox: create Virtual Disk media-sda for ISO {request_vm['iso']}")
                 if args.command == "prepare":
@@ -1186,7 +1206,7 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                 if existing:
                     record = get_vm(config, request_vm["name"], cluster_id, device_id)
                     context = (record.get("local_context_data") or {}).get("vmctl") or {}
-                    if context.get("version") not in (2, 3) or context.get("source") != request_vm["source"]:
+                    if context.get("version") not in (2, 3, 4) or context.get("source") != request_vm["source"]:
                         raise NetBoxError("existing NetBox VM does not match this preparation request")
                 else:
                     reserve_vm(config, request_vm, cluster_id, device_id)
@@ -1195,7 +1215,7 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                 reserve_vm(config, request_vm, cluster_id, device_id)
                 record = get_vm(config, request_vm["name"], cluster_id, device_id)
             reserved_name = request_vm["name"]
-            create_vm_components(config, record, request_vm.get("interface_name", "inet"),
+            create_vm_components(config, record, request_vm.get("interface_name", "eth0"),
                                  request_vm.get("mac_address"),
                                  request_vm["disk_gb"] * 1024)
             if args.command == "prepare":
@@ -1243,7 +1263,7 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                     verify_local_vm(vm, config)
                 except ValueError:
                     context = (record.get("local_context_data") or {}).get("vmctl") or {}
-                    if context.get("version") not in (2, 3):
+                    if context.get("version") not in (2, 3, 4):
                         raise
                     if not args.dry_run:
                         patch_vm(config, record["id"], {

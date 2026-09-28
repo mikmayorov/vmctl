@@ -105,7 +105,7 @@ vmctl adopt                 # локальные ВМ → NetBox
 vmctl audit
 ```
 
-`adopt ИМЯ` импортирует одну ВМ. Команда переносит CPU, память, UUID в Serial, Description, статус, автозапуск, диски и подключённые ISO как Virtual Disks с размером и полным путём, интерфейсы и MAC. Имя VM Interface приводится к стабильному имени TAP на хосте (`vm-...`); интерфейс и его назначенные IP сохраняются. Если у ВМ по одному локальному NIC и VM Interface в NetBox, `adopt` сопоставит их даже при разных именах и ещё не назначенном Primary MAC. При нескольких неоднозначных интерфейсах задайте Primary MAC в NetBox для сопоставления; IP снимать не требуется. Команда не меняет libvirt и не создаёт IP: их назначают вручную в NetBox IPAM. Уже заполненный Serial с другим UUID блокирует импорт. Для импортированной ВМ `sync` может применять поддерживаемые изменения, но не воссоздаёт утраченную локальную ВМ.
+`adopt ИМЯ` импортирует одну ВМ. Команда переносит CPU, память, UUID в Serial, Description, статус, автозапуск, диски и подключённые ISO как Virtual Disks с размером и полным путём, интерфейсы и MAC. Для каждого VM Interface она записывает в Context имя TAP на хосте и мост. Существующие VM Interface, их имена и назначенные IP сохраняются. Если у ВМ по одному локальному NIC и VM Interface в NetBox, `adopt` сопоставит их даже при разных именах и ещё не назначенном Primary MAC. При нескольких неоднозначных интерфейсах задайте Primary MAC в NetBox для сопоставления; IP снимать не требуется. Команда не меняет libvirt и не создаёт IP: их назначают вручную в NetBox IPAM. Уже заполненный Serial с другим UUID блокирует импорт. Для импортированной ВМ `sync` может применять поддерживаемые изменения, но не воссоздаёт утраченную локальную ВМ.
 
 ### 3.2. Создание ВМ
 
@@ -186,7 +186,7 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 
 #### `adopt`
 
-`vmctl adopt guest` переносит фактические параметры одной локальной ВМ в NetBox, `vmctl adopt` — всех. `vmctl --dry-run adopt` показывает план. Полный `adopt` обновляет также дисплей и остальные наблюдаемые параметры ВМ. Если требуется **только** привести имена существующих VM Interfaces к именам TAP, используйте `vmctl --dry-run adopt --interfaces-only`, затем `vmctl adopt --interfaces-only` (или добавьте имя ВМ): остальные поля NetBox сохраняются. Libvirt и IPAM команды не меняют. Device хоста и кластер должны уже существовать.
+`vmctl adopt guest` переносит фактические параметры одной локальной ВМ в NetBox, `vmctl adopt` — всех. `vmctl --dry-run adopt` показывает план. Полный `adopt` обновляет также дисплей и остальные наблюдаемые параметры ВМ. Он заполняет `vmctl.interfaces` и переводит старую запись Context на новую схему, сохраняя имена VM Interfaces и их IP. Если нужно **только** перевести сетевое описание на новую схему и сохранить дисплей, ресурсы и прочие поля NetBox, выполните `vmctl --dry-run adopt --interfaces-only`, затем `vmctl adopt --interfaces-only` (можно указать одну ВМ). Libvirt и IPAM команды не меняют. Device хоста и кластер должны уже существовать.
 
 #### `delete`
 
@@ -200,7 +200,7 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 
 #### `nic add`, `nic remove`
 
-`vmctl nic add guest backup` создаёт интерфейс и MAC на мосту по умолчанию. `vmctl nic add guest backup --bridge br1 --mac 52:54:00:12:34:56` задаёт мост и MAC. В режиме NetBox имя `backup` служит коротким аргументом команды, а запись VM Interface получает стабильное имя TAP `vm-ИМЯ-хеш`; его также видно через `ip link`/`vmctl list`. `vmctl nic remove guest backup` или `vmctl nic remove guest vm-ИМЯ-хеш` удаляет интерфейс и MAC при выключенной ВМ; сначала снимите назначенные IP в NetBox.
+`vmctl nic add guest backup` создаёт VM Interface `backup` и MAC гостя на мосту по умолчанию; имя TAP и мост записывает в `vmctl.interfaces.backup`. `vmctl nic add guest backup --bridge br1 --mac 52:54:00:12:34:56` задаёт мост и MAC. `vmctl nic remove guest backup` удаляет интерфейс и MAC при выключенной ВМ; сначала снимите назначенные IP в NetBox.
 
 ### Питание
 
@@ -226,7 +226,7 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 | UUID | `Serial` ВМ | Новая ВМ получает UUID до создания в libvirt; `adopt` переносит существующий. Несовпадающий Serial блокирует `sync`/`adopt`. |
 | Автозапуск | `Start on boot` ВМ | Меняйте через `autostart`/`autostart-off`; обычный `sync` автозапуск не переключает. |
 | Диски и ISO | `Virtual Disks`: `Size` в МиБ, полный путь в `Description` | `adopt` переносит оба вида носителей. Размер ISO входит в общий Disk ВМ. `sync` не меняет размер существующего qcow2 и пока не переподключает импортированные ISO. |
-| Интерфейсы и MAC | `VM Interfaces` и Primary MAC | Имя созданного `vmctl` VM Interface совпадает с именем TAP на хосте (`vm-...`). Primary MAC — адрес **гостевого** адаптера; MAC TAP, видимый как `link/ether` на хосте, может отличаться. `sync` применяет значения к постоянному XML; работающей ВМ нужен следующий запуск. |
+| Интерфейсы и MAC | `VM Interfaces` и Primary MAC | Имя VM Interface обозначает гостевой NIC; для новой ВМ по умолчанию `eth0`. Primary MAC — адрес **гостевого** адаптера. Имя хостового TAP и мост хранятся отдельно в Context. `sync` применяет значения к постоянному XML; работающей ВМ нужен следующий запуск. |
 | IPv4/IPv6 | IPAM: адрес на интерфейсе, затем Primary IP ВМ при необходимости | Адрес назначает администратор вручную. `vmctl` читает и проверяет привязку; сеть гостя не настраивает. |
 | Мост, источник установки, пути, дисплей | `local_context_data.vmctl` ВМ | `sync` строит постоянную конфигурацию. Для нового запроса значения по умолчанию берутся из `config.toml`. |
 
@@ -237,11 +237,13 @@ guest NIC: 52:54:00:a8:0d:88  — адаптер внутри ВМ; этот MAC
 host NIC:  fe:54:00:a8:0d:88  — TAP на хосте; его показывает ip link show dev vm-...
 ```
 
-libvirt задаёт TAP другой первый байт (`fe` вместо `52`), чтобы у двух сторон не было одинакового MAC и не нарушалась передача кадров. Имя TAP при этом совпадает с именем VM Interface в NetBox. `vmctl check ИМЯ` показывает MAC гостя в таблице и MAC хостового TAP отдельно. [Объяснение разработчика libvirt](https://lists.libvirt.org/archives/list/devel%40lists.libvirt.org/thread/IYBXRAMRWTCDKV23MJQPONKPLOFCBM5F/).
+libvirt задаёт TAP другой первый байт (`fe` вместо `52`), чтобы у двух сторон не было одинакового MAC и не нарушалась передача кадров. MAC TAP не записывается в NetBox: он относится к хостовой реализации интерфейса. `vmctl check ИМЯ` показывает MAC гостя, имя TAP и его master-мост в таблице. [Объяснение разработчика libvirt](https://lists.libvirt.org/archives/list/devel%40lists.libvirt.org/thread/IYBXRAMRWTCDKV23MJQPONKPLOFCBM5F/).
 
 `local_context_data.vmctl.display` задаёт `type` (`vnc`, `spice`, `none`), `listen` (IP **хоста**), `port` (`"auto"` или 5900–65535), `password`. Пример: `{"type":"vnc","listen":"127.0.0.1","port":"auto"}`. На внешнем адресе пароль обязателен; VNC использует максимум 8 байт пароля. Для удалённого доступа удобно оставить loopback и открыть SSH-туннель. Пароль хранится в NetBox и XML libvirt открытым текстом; `check guest` тоже его показывает. Ограничивайте права чтения. Меняйте объект `vmctl.display`, сохраняя остальные поля `vmctl`; затем выполните `vmctl --dry-run sync guest` и `vmctl sync guest`. Работающей ВМ нужен следующий запуск.
 
-Мост ВМ (`br1` и т. п.) хранится в `local_context_data.vmctl.bridge` или `interface_bridges`; это имя локального Linux-моста, к которому libvirt подключает TAP. Поле NetBox **Related Interfaces / Bridged Interface** связывает только интерфейсы внутри одной ВМ, поэтому оно не может ссылаться на `br1` в Device хоста. Для видимой в NetBox ссылки на интерфейс Device можно вручную создать необязательное объектное custom field на VM Interface с типом связанного объекта `dcim.interface`; текущий `vmctl` продолжает брать имя моста из `local_context_data.vmctl`. Для просмотра такого поля API-пользователю понадобится дополнительное право `dcim.interface: view` с ограничением `{"device__owner__users":"$user"}`. [Модель VM Interface](https://netboxlabs.com/docs/netbox/v4.2/models/virtualization/vminterface/), [объектные custom fields](https://netboxlabs.com/docs/netbox/customization/custom-fields/).
+Каждый VM Interface новой схемы имеет запись в `local_context_data.vmctl.interfaces` по своему имени. Например: `{"eth0":{"host_dev":"vm-guest-a1b2c3","bridge":"br1"}}`. `host_dev` — постоянное имя TAP в XML libvirt, `bridge` — Linux-мост хоста. При изменении Context `sync` применяет его к постоянному XML; текущая работающая ВМ изменится после полного выключения и запуска. Для старых записей версии 3 `vmctl` по-прежнему читает `interface_bridges`/`bridge`; полный `adopt` переводит их на новую схему. Имя `eth0` в NetBox — логическое обозначение NIC: само по себе оно не переименовывает интерфейс внутри гостевой ОС.
+
+Отдельные Device Interfaces для TAP создавать не требуется. Поле NetBox **Related Interfaces / Bridged Interface** связывает только интерфейсы внутри одной ВМ, поэтому оно не может ссылаться на мост Device хоста. [Модель VM Interface](https://netboxlabs.com/docs/netbox/v4.5/models/virtualization/vminterface/).
 
 Статусы: `planned` — запись до создания на хосте; `staged` — ВМ определена, запуск не запрошен; `active` — должна работать; `offline` — должна быть выключена. `sync` применяет питание для `active`/`offline`. Если NetBox недоступен, управляемая операция останавливается до локального изменения. Если ошибка случилась после записи NetBox, проверьте `audit` и повторите `sync`.
 

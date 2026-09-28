@@ -71,6 +71,24 @@ class ComponentTests(unittest.TestCase):
             self.assertEqual(vmctl.component_command(config, args), 0)
         self.assertEqual(add.call_args.args[2]["name"], host_interface_name("guest", "backup"))
 
+    def test_managed_nic_add_keeps_guest_name_and_records_host_tap_in_context(self):
+        args = Namespace(command="nic", action="add", vm="guest", name="backup",
+                         bridge=None, mac=None, dry_run=False)
+        config = {"netbox": {"key": "secret"}, "network": {"bridge": "br1"}}
+        record = {"id": 7, "name": "guest", "local_context_data": {"vmctl": {
+            "version": 4, "interfaces": {"eth0": {"host_dev": "vm-guest-123456", "bridge": "br0"}}}}}
+        with (patch("vmctl._stopped", return_value=False),
+              patch("vmctl.find_device", return_value=(1, 2)),
+              patch("vmctl.get_vm", return_value=record),
+              patch("vmctl.vm_interfaces", return_value=[]),
+              patch("vmctl.add_component", return_value={"id": 8}) as add,
+              patch("vmctl.ensure_primary_mac"),
+              patch("vmctl.patch_vm") as update):
+            self.assertEqual(vmctl.component_command(config, args), 0)
+        self.assertEqual(add.call_args.args[2]["name"], "backup")
+        self.assertEqual(update.call_args.args[2]["local_context_data"]["vmctl"]["interfaces"]["backup"], {
+            "host_dev": host_interface_name("guest", "backup"), "bridge": "br1"})
+
     def test_dry_run_plans_tap_name_change_for_running_vm(self):
         with tempfile.TemporaryDirectory() as directory:
             disk = Path(directory) / "guest.qcow2"

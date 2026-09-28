@@ -40,6 +40,10 @@ def host_interface_name(vm_name: str, interface_name: str) -> str:
     return f"vm-{label}-{digest}"
 
 
+def target_interface_name(vm_name: str, item: dict) -> str:
+    return item.get("host_dev") or host_interface_name(vm_name, item["name"])
+
+
 def pending_purge_file(project_dir: Path, name: str) -> Path:
     return project_dir / "state" / "pending-purge" / f"{name}.json"
 
@@ -87,7 +91,7 @@ def _interface_element(devices: ET.Element, item: dict, vm_name: str) -> ET.Elem
     if item.get("mac_address"):
         ET.SubElement(node, "mac", {"address": item["mac_address"].lower()})
     ET.SubElement(node, "source", {"bridge": item["bridge"]})
-    ET.SubElement(node, "target", {"dev": host_interface_name(vm_name, item["name"])})
+    ET.SubElement(node, "target", {"dev": target_interface_name(vm_name, item)})
     ET.SubElement(node, "model", {"type": "virtio"})
     ET.SubElement(node, "alias", {"name": item.get("alias") or interface_alias(item["name"])})
     return node
@@ -218,7 +222,7 @@ def verify_local_vm(vm: dict, config: dict, live: bool = False) -> None:
         interface_match = (local.find("source") is not None
                            and local.find("source").get("bridge") == wanted["bridge"]
                            and local.find("target") is not None
-                           and local.find("target").get("dev") == host_interface_name(vm["name"], wanted["name"])
+                           and local.find("target").get("dev") == target_interface_name(vm["name"], wanted)
                            and (not wanted.get("mac_address") or
                                 local.find("mac") is not None and local.find("mac").get("address", "").lower() == wanted["mac_address"].lower()))
     else:
@@ -229,7 +233,7 @@ def verify_local_vm(vm: dict, config: dict, live: bool = False) -> None:
             if local is None or local.find("source") is None or local.find("mac") is None or \
                     local.find("source").get("bridge") != wanted["bridge"] or \
                     local.find("target") is None or \
-                    local.find("target").get("dev") != host_interface_name(vm["name"], wanted["name"]) or \
+                    local.find("target").get("dev") != target_interface_name(vm["name"], wanted) or \
                     local.find("mac").get("address", "").lower() != wanted["mac_address"].lower():
                 interface_match = False
     graphics = root.find("./devices/graphics")
@@ -357,7 +361,7 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
         target = node.find("target")
         if target is None:
             target = ET.SubElement(node, "target")
-        target.set("dev", host_interface_name(vm["name"], item["name"]))
+        target.set("dev", target_interface_name(vm["name"], item))
     for key, item in wanted.items():
         if key not in used:
             _interface_element(devices, item, vm["name"])

@@ -214,7 +214,7 @@ def ensure_primary_mac(config: dict, interface: dict, mac: str | None = None) ->
     return mac
 
 
-def create_vm_components(config: dict, record: dict, interface_name: str = "inet", mac: str | None = None,
+def create_vm_components(config: dict, record: dict, interface_name: str | None = None, mac: str | None = None,
                          root_size_mb: int | None = None) -> None:
     """Create the NetBox disk, interface and primary MAC before local provisioning."""
     vm_id = record["id"]
@@ -248,21 +248,33 @@ def create_vm_components(config: dict, record: dict, interface_name: str = "inet
             })
         elif int(media["size"]) != size or media.get("description") != iso:
             raise NetBoxError(f"VM {record['name']}: ISO Virtual Disk differs from the preparation request")
-    tap_name = host_interface_name(record["name"], interface_name)
+    if context.get("version") == 4:
+        layout = context.get("interfaces")
+        if not isinstance(layout, dict) or len(layout) != 1:
+            raise NetBoxError("prepared VM must describe exactly one initial interface in vmctl.interfaces")
+        guest_name = next(iter(layout))
+        if interface_name is not None and interface_name != guest_name:
+            raise NetBoxError(f"prepared guest interface is {guest_name!r}, not {interface_name!r}")
+    else:
+        guest_name = host_interface_name(record["name"], interface_name or "inet")
     interfaces = vm_interfaces(config, vm_id)
     if not interfaces:
         interface = _request(config, "POST", "virtualization/interfaces/", {
-            "virtual_machine": vm_id, "name": tap_name, "enabled": True,
+            "virtual_machine": vm_id, "name": guest_name, "enabled": True,
         })
     else:
-        interface = next((item for item in interfaces if item["name"] in (tap_name, interface_name)), None)
+        interface = next((item for item in interfaces if item["name"] in (guest_name, interface_name)), None)
         if interface is None:
-            raise NetBoxError(f"NetBox interface {tap_name!r} is missing for {record['name']}")
+            raise NetBoxError(f"NetBox interface {guest_name!r} is missing for {record['name']}")
     ensure_primary_mac(config, interface, mac)
 
 
 def normalize_vm_interface_names(config: dict, record: dict, vm: dict, dry_run: bool) -> bool:
-    """Rename existing VM interfaces to host TAP names without adopting other VM fields."""
+    """Migrate only VM-to-host interface mappings, preserving other NetBox fields."""
+    data = dict(record.get("local_context_data") or {})
+    context = dict(data.get("vmctl") or {})
+    if context.get("version") not in (2, 3, 4):
+        raise NetBoxError(f"VM {vm['name']}: full adopt is needed before interface-only migration")
     interfaces = vm_interfaces(config, record["id"])
     observed = vm.get("interfaces", [])
     if len(interfaces) != len(observed):
@@ -274,44 +286,45 @@ def normalize_vm_interface_names(config: dict, record: dict, vm: dict, dry_run: 
         match = next((item for item in interfaces if item["id"] not in used and
                       (item.get("primary_mac_address") or {}).get("mac_address", "").lower() == mac), None)
         if match is None:
-            raise NetBoxError(f"VM {vm['name']}: no NetBox interface with guest MAC {mac}")
+            raise NetBoxError(f"VM {vm['name']}: no NetBox interface with guest MAC {mac}; run full adopt first")
         used.add(match["id"])
-        host_dev = local.get("host_dev")
-        seed = host_dev if isinstance(host_dev, str) and host_dev.startswith("vm-") else (
-            local.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))
-        target = host_interface_name(vm["name"], seed)
-        plan.append((match, target, local))
+        old_layout = context.get("interfaces") or {}
+        if not isinstance(old_layout, dict):
+            raise NetBoxError(f"VM {vm['name']}: invalid vmctl.interfaces")
+        previous = old_layout.get(match["name"]) or {}
+        if not isinstance(previous, dict):
+            raise NetBoxError(f"VM {vm['name']}: invalid vmctl.interfaces.{match['name']}")
+        observed_dev = local.get("host_dev")
+        seed = observed_dev if isinstance(observed_dev, str) and observed_dev.startswith("vm-") else match["name"]
+        target = previous.get("host_dev") or host_interface_name(vm["name"], seed)
+        old_bridges = context.get("interface_bridges") or {}
+        if not isinstance(old_bridges, dict):
+            raise NetBoxError(f"VM {vm['name']}: invalid vmctl.interface_bridges")
+        bridge = (previous.get("bridge") or old_bridges.get(match["name"]) or
+                  context.get("bridge") or local.get("bridge"))
+        if not isinstance(bridge, str) or not bridge or Path(bridge).name != bridge:
+            raise NetBoxError(f"VM {vm['name']}: invalid bridge for {match['name']}")
+        plan.append((match, target, bridge))
     if len({target for _, target, _ in plan}) != len(plan):
         raise NetBoxError(f"VM {vm['name']}: duplicate host TAP interface names")
-    renames = [(item, target) for item, target, _ in plan if item["name"] != target]
-    data = dict(record.get("local_context_data") or {})
-    context = dict(data.get("vmctl") or {})
-    bridges = dict(context.get("interface_bridges") or {})
-    new_bridges = dict(bridges)
-    for item, target, _ in plan:
-        if item["name"] != target and item["name"] in new_bridges:
-            new_bridges[target] = new_bridges.pop(item["name"])
-    new_context = dict(context)
-    if new_bridges != bridges:
-        new_context["interface_bridges"] = new_bridges
-    if context.get("interface_name") in {item["name"] for item, _, _ in plan}:
-        new_context["interface_name"] = next(target for item, target, _ in plan
-                                             if item["name"] == context["interface_name"])
-    if not renames and new_context == context:
+    layout = {item["name"]: {"host_dev": target, "bridge": bridge}
+              for item, target, bridge in plan}
+    new_context = {**context, "version": 4, "interfaces": layout}
+    new_context.pop("interface_bridges", None)
+    new_context.pop("interface_name", None)
+    new_context.pop("bridge", None)
+    if new_context == context:
         print(f"UNCHANGED {vm['name']} interfaces")
         return False
-    print(f"{'WOULD UPDATE' if dry_run else 'UPDATED'} {vm['name']} interfaces: {len(renames)} rename(s)")
-    for item, target in renames:
-        print(f"  RENAME VM Interface {item['name']} → {target} (IP and MAC stay assigned)")
+    print(f"{'WOULD UPDATE' if dry_run else 'UPDATED'} {vm['name']} interface context; VM Interface names and IPs stay assigned")
+    for item, target, bridge in plan:
+        print(f"  MAP {item['name']} → {target} @ {bridge}")
     if dry_run:
         return True
-    if new_context != context:
-        patch_vm(config, record["id"], {
-            "local_context_data": {**data, "vmctl": new_context},
-            "changelog_message": "vmctl normalized host TAP interface names",
-        })
-    for item, target in renames:
-        _request(config, "PATCH", f"virtualization/interfaces/{item['id']}/", {"name": target})
+    patch_vm(config, record["id"], {
+        "local_context_data": {**data, "vmctl": new_context},
+        "changelog_message": "vmctl recorded guest-to-host interface mappings",
+    })
     return True
 
 
@@ -356,10 +369,14 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
     named_disks = [{**item, "name": vm["name"] if index == 0 else f"disk-{index + 1}"}
                    for index, item in enumerate(local_disks)]
     media_disks = named_media(vm)
-    named_interfaces = [{**item, "name": host_interface_name(vm["name"],
-                         item.get("host_dev") if str(item.get("host_dev") or "").startswith("vm-") else
-                         item.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))}
+    named_interfaces = [{**item, "name": f"eth{index}"}
                         for index, item in enumerate(local_interfaces)]
+    interface_layout = {item["name"]: {
+        "host_dev": host_interface_name(vm["name"],
+                                         item["host_dev"] if str(item.get("host_dev") or "").startswith("vm-")
+                                         else item["name"]),
+        "bridge": item["bridge"],
+    } for item in named_interfaces}
     payload = {
         "name": vm["name"], "serial": serial, "cluster": cluster_id, "device": device_id,
         "status": vm["status"], "vcpus": vm["vcpus"],
@@ -367,10 +384,9 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
         "description": vm.get("description", ""),
         "start_on_boot": "on" if vm["autostart"] else "off",
         "local_context_data": {"vmctl": {
-            "version": 3, "source": "existing", "bridge": vm.get("bridge"),
+            "version": 4, "source": "existing",
             "mounted_media": [{"name": item["name"], "target": item["target"]} for item in media_disks],
-            "interface_bridges": {item["name"]: item["bridge"] for item in named_interfaces},
-            "interface_name": named_interfaces[0]["name"] if named_interfaces else None,
+            "interfaces": interface_layout,
             "display": vm.get("display"),
         }},
         "changelog_message": "Imported existing libvirt VM with vmctl",
@@ -477,10 +493,7 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
         if match is None:
             name = local.get("name") or ("inet" if index == 0 else f"net-{index + 1}")
             match = next((item for item in interfaces if item["id"] not in used_nics and item["name"] == name), None)
-        host_dev = local.get("host_dev")
-        logical_name = (host_dev if isinstance(host_dev, str) and host_dev.startswith("vm-") else
-                        local.get("name") or ("inet" if index == 0 else f"net-{index + 1}"))
-        name = host_interface_name(vm["name"], logical_name)
+        name = match["name"] if match else f"eth{index}"
         if not COMPONENT_NAME.fullmatch(name):
             raise NetBoxError(f"VM {vm['name']}: invalid interface name {name!r}")
         if match:
@@ -490,13 +503,13 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
     unmatched_netbox = [item for item in interfaces if item["id"] not in used_nics]
     if len(unmatched_local) == len(unmatched_netbox) == 1:
         index = unmatched_local[0]
-        local, _, name = nic_plan[index]
+        local, _, _ = nic_plan[index]
         match = unmatched_netbox[0]
-        nic_plan[index] = (local, match, name)
+        nic_plan[index] = (local, match, match["name"])
         used_nics.add(match["id"])
     stale_nics = [item for item in interfaces if item["id"] not in used_nics]
     if len({name for _, _, name in nic_plan}) != len(nic_plan):
-        raise NetBoxError(f"VM {vm['name']}: duplicate host TAP interface names")
+        raise NetBoxError(f"VM {vm['name']}: duplicate guest interface names")
     for item in stale_nics:
         if interface_ips(config, item["id"]):
             raise NetBoxError(f"VM {vm['name']}: cannot match NetBox interface {item['name']} with IP addresses "
@@ -511,13 +524,29 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
                                   "select one Primary MAC in NetBox before adoption")
             assigned_macs[match["id"]] = macs
 
-    new_context = {**context, "version": 3, "source": "existing",
-                   "bridge": local_interfaces[0]["bridge"] if local_interfaces else None,
-                   "interface_bridges": {name: item["bridge"] for item, _, name in nic_plan},
-                   "interface_name": nic_plan[0][2] if nic_plan else None,
+    old_layout = context.get("interfaces") if context.get("version") == 4 else None
+    if old_layout is not None and not isinstance(old_layout, dict):
+        raise NetBoxError(f"VM {vm['name']}: vmctl.interfaces must be a mapping")
+    layout = {}
+    for item, _, name in nic_plan:
+        previous = (old_layout or {}).get(name) or {}
+        if not isinstance(previous, dict):
+            raise NetBoxError(f"VM {vm['name']}: invalid vmctl.interfaces.{name}")
+        observed = item.get("host_dev")
+        host_dev = (host_interface_name(vm["name"], observed)
+                    if isinstance(observed, str) and observed.startswith("vm-") else
+                    previous.get("host_dev") or host_interface_name(vm["name"], name))
+        layout[name] = {"host_dev": host_dev, "bridge": item["bridge"]}
+    if len({entry["host_dev"] for entry in layout.values()}) != len(layout):
+        raise NetBoxError(f"VM {vm['name']}: duplicate host TAP names")
+    new_context = {**context, "version": 4, "source": "existing",
+                   "interfaces": layout,
                    "mounted_media": [{"name": name, "target": item["target"]}
                                      for item, _, name in disk_plan[len(local_disks):]],
                    "display": vm.get("display")}
+    new_context.pop("bridge", None)
+    new_context.pop("interface_bridges", None)
+    new_context.pop("interface_name", None)
     new_context.pop("disk_paths_by_name", None)
     new_context.pop("disk_paths", None)
     changes = {"vcpus": vm["vcpus"], "memory": vm["memory_mb"],
@@ -543,7 +572,7 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
                     if match is None or int(match["size"]) != local["size_mb"]
                     or match.get("description") != local["path"]]
     nic_changes = [(local, match, name) for local, match, name in nic_plan
-                   if match is None or match["name"] != name or
+                   if match is None or
                    (match.get("primary_mac_address") or {}).get("mac_address", "").lower()
                    != local["mac_address"].lower()]
     if not (changes or disk_changes or stale_disks or nic_changes or stale_nics):
@@ -560,8 +589,8 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
     for item in stale_disks:
         print(f"  REMOVE Virtual Disk {item['name']}")
     for _, match, name in nic_changes:
-        if match and match["name"] != name:
-            print(f"  RENAME VM Interface {match['name']} → {name} (IP stays assigned; MAC follows local VM)")
+        if match:
+            print(f"  KEEP VM Interface {name} (IP stays assigned; MAC follows local VM)")
     if dry_run:
         return True
     if changes:
@@ -578,8 +607,6 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
     for local, match, name in nic_changes:
         if match is None:
             match = add_component(config, "nic", {"virtual_machine": vm_id, "name": name, "enabled": True})
-        elif match["name"] != name:
-            _request(config, "PATCH", f"virtualization/interfaces/{match['id']}/", {"name": name})
         primary = match.get("primary_mac_address")
         if primary and primary.get("mac_address", "").lower() != local["mac_address"].lower():
             _request(config, "PATCH", f"dcim/mac-addresses/{primary['id']}/", {"mac_address": local["mac_address"]})
@@ -609,6 +636,9 @@ def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
         raise NetBoxError("config needs network.bridge")
     if not isinstance(storage_directory, str) or not storage_directory.startswith("/"):
         raise NetBoxError("config needs an absolute storage.directory")
+    guest_name = vm.get("interface_name") or "eth0"
+    if not COMPONENT_NAME.fullmatch(guest_name):
+        raise NetBoxError(f"invalid guest interface name: {guest_name!r}")
     payload = {
         "name": vm["name"],
         "serial": str(uuid.uuid4()),
@@ -622,14 +652,16 @@ def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
         "description": vm.get("description", ""),
         "local_context_data": {
             "vmctl": {
-                "version": 3,
+                "version": 4,
                 "source": vm["source"],
                 "iso": vm.get("iso"),
                 "image": vm.get("image"),
                 "user_data": vm.get("user_data"),
-                "bridge": bridge,
                 "storage_directory": storage_directory,
-                "interface_name": host_interface_name(vm["name"], vm.get("interface_name", "inet")),
+                "interfaces": {guest_name: {
+                    "host_dev": host_interface_name(vm["name"], guest_name),
+                    "bridge": bridge,
+                }},
                 "mounted_media": [{"name": "media-sda", "target": "sda"}] if vm["source"] == "iso" else [],
                 "display": {"type": "vnc", "listen": "127.0.0.1", "port": "auto"},
             }
@@ -658,7 +690,7 @@ def patch_vm(config: dict, vm_id: int, changes: dict) -> dict:
 def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
     context_data = record.get("local_context_data") or {}
     context = context_data.get("vmctl") if isinstance(context_data, dict) else None
-    if not isinstance(context, dict) or context.get("version") not in (1, 2, 3):
+    if not isinstance(context, dict) or context.get("version") not in (1, 2, 3, 4):
         raise NetBoxError("NetBox VM has no supported vmctl context; run vmctl adopt to import the local VM")
     try:
         memory = int(record["memory"])
@@ -683,7 +715,7 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         "bridge": context.get("bridge"),
         "storage_directory": context.get("storage_directory"),
     }
-    if context["version"] in (2, 3):
+    if context["version"] in (2, 3, 4):
         if config is None:
             raise NetBoxError("NetBox VM inventory needs a NetBox connection")
         interfaces = vm_interfaces(config, record["id"])
@@ -745,6 +777,11 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         bridges = context.get("interface_bridges") or {}
         if not isinstance(bridges, dict):
             raise NetBoxError("vmctl interface_bridges must be a mapping")
+        layout = context.get("interfaces") if context["version"] == 4 else None
+        if context["version"] == 4 and not isinstance(layout, dict):
+            raise NetBoxError("vmctl.interfaces must be a mapping")
+        if layout is not None and set(layout) != {item["name"] for item in interfaces}:
+            raise NetBoxError("vmctl.interfaces must describe every VM Interface exactly once")
         wanted_interfaces = []
         ip_ids = set()
         for item in interfaces:
@@ -754,13 +791,28 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
             primary_mac = item.get("primary_mac_address")
             if not isinstance(primary_mac, dict) or not primary_mac.get("mac_address"):
                 raise NetBoxError(f"NetBox interface {interface_name!r} needs a primary MAC address")
-            bridge = bridges.get(interface_name, context.get("bridge") or config.get("network", {}).get("bridge"))
+            host_dev = None
+            if layout is not None:
+                entry = layout[interface_name]
+                if not isinstance(entry, dict):
+                    raise NetBoxError(f"vmctl.interfaces.{interface_name} must be an object")
+                bridge = entry.get("bridge")
+                host_dev = entry.get("host_dev")
+                if not isinstance(host_dev, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", host_dev):
+                    raise NetBoxError(f"invalid host TAP name for interface {interface_name!r}")
+            else:
+                bridge = bridges.get(interface_name, context.get("bridge") or config.get("network", {}).get("bridge"))
             if not isinstance(bridge, str) or not bridge or Path(bridge).name != bridge:
                 raise NetBoxError(f"invalid bridge for interface {interface_name!r}")
-            wanted_interfaces.append({"name": interface_name, "mac_address": primary_mac["mac_address"], "bridge": bridge})
+            wanted = {"name": interface_name, "mac_address": primary_mac["mac_address"], "bridge": bridge}
+            if host_dev:
+                wanted["host_dev"] = host_dev
+            wanted_interfaces.append(wanted)
             ip_ids.update(item["id"] for item in interface_ips(config, item["id"]))
         if len({item["name"] for item in wanted_interfaces}) != len(wanted_interfaces):
             raise NetBoxError("duplicate NetBox interface name")
+        if layout is not None and len({item["host_dev"] for item in wanted_interfaces}) != len(wanted_interfaces):
+            raise NetBoxError("duplicate host TAP names in vmctl.interfaces")
         wanted_interfaces.sort(key=lambda item: item["name"])
         for family in (4, 6):
             primary_ip = record.get(f"primary_ip{family}")
@@ -779,4 +831,5 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         if wanted_interfaces:
             result["interface_name"] = wanted_interfaces[0]["name"]
             result["mac_address"] = wanted_interfaces[0]["mac_address"]
+            result["bridge"] = wanted_interfaces[0]["bridge"]
     return result
