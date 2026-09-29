@@ -12,7 +12,7 @@
 
 ## 1. Установка на HOST
 
-Нужны Linux с KVM, Python 3.11+, работающий libvirt с соединением `qemu:///system`, `virsh`, `qemu-img`, место для дисков и настроенный сетевой мост. Приведённые команды рассчитаны на `root`.
+Нужны Linux с KVM, Python 3.11+, работающий libvirt с соединением `qemu:///system`, `virsh`, `qemu-img`, место для дисков и настроенный сетевой мост. Для `man vmctl` нужна утилита `man` и локаль UTF-8. Приведённые команды рассчитаны на `root`.
 
 ```bash
 git clone https://github.com/mikmayorov/vmctl.git /opt/vmctl
@@ -34,6 +34,8 @@ vmctl list                  # список ВМ хоста
 vmctl -h                    # краткая справка; vmctl КОМАНДА -h — параметры
 man vmctl                   # полное руководство по командам на русском
 ```
+
+Если терминал использует локаль `C`/`POSIX`, откройте страницу через `LANG=C.UTF-8 man vmctl`.
 
 Обновление: `cd /opt/vmctl && git pull --ff-only && vmctl check`. Ссылка на man-страницу при обновлении остаётся актуальной. Файлы запросов ВМ удобно хранить в `local/`.
 
