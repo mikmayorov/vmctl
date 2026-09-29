@@ -27,6 +27,8 @@ from vmcreate import (NAME_RE, create_vm, host_interface_name, interface_alias, 
 
 
 DEFAULT_CONFIG = Path(__file__).with_name("config.toml")
+VM_OPERATION_ERRORS = (NetBoxError, ValueError, OSError, KeyError, TypeError,
+                       subprocess.CalledProcessError)
 
 
 def refresh_guest_links(config: dict, names: list[str] | None = None,
@@ -227,10 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
     nic = add("nic", "Добавить или удалить интерфейс выключенной ВМ. IP-адреса назначают вручную в NetBox IPAM.",
               "vmctl nic add guest backup --bridge br1")
     nic_actions = nic.add_subparsers(dest="action", required=True, title="Действия", metavar="{add,remove}")
-    nic_add = add("add", "Добавить интерфейс и primary MAC к выключенной ВМ; имя NetBox в управляемом режиме будет именем TAP.",
+    nic_add = add("add", "Добавить гостевой интерфейс и primary MAC к выключенной ВМ; TAP и мост записать в Context.",
                   "vmctl nic add guest backup --bridge br1", nic_actions)
     nic_add.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
-    nic_add.add_argument("name", metavar="ИНТЕРФЕЙС", help="Короткое имя нового интерфейса; в NetBox записывается производное имя TAP")
+    nic_add.add_argument("name", metavar="ИНТЕРФЕЙС", help="Имя гостевого VM Interface в NetBox")
     nic_add.add_argument("--bridge", metavar="МОСТ",
                          help="Существующий мост хоста; без флага берётся мост ВМ или хоста")
     nic_add.add_argument("--mac", metavar="MAC",
@@ -404,7 +406,7 @@ def show_list(config: dict) -> int:
                          "да" if vm["autostart"] else "нет",
                          ",".join(item["host_dev"] for item in vm["interfaces"] if item.get("host_dev")) or "-",
                          primary_ip("4"), primary_ip("6"), display_url(display), vm.get("uuid") or "-"))
-        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        except VM_OPERATION_ERRORS as error:
             failed = True
             print(f"{name}: не удалось прочитать параметры: {error}", file=sys.stderr)
             rows.append((name, *("-" for _ in range(len(headings) - 1))))
@@ -774,7 +776,7 @@ def audit(config: dict) -> int:
                     else:
                         print(f"DIFF {name} {field}: NetBox={wanted!r} local={observed!r}")
                     problems += 1
-        except (ValueError, KeyError, subprocess.CalledProcessError) as error:
+        except VM_OPERATION_ERRORS as error:
             print(f"INVALID {name}: {error}")
             problems += 1
     print(f"Audit: {len(names)} local, {len(remote)} NetBox, {problems} issue(s)")
@@ -793,32 +795,36 @@ def adopt(config: dict, dry_run: bool, name: str | None = None, interfaces_only:
         if name not in names:
             raise ValueError(f"local VM {name!r} does not exist")
         names = [name]
+    failures = 0
     for vm_name in names:
-        existing = remote.get(vm_name)
-        if not existing:
-            duplicate = find_vm(config, vm_name, cluster_id)
-            if duplicate:
-                raise NetBoxError(f"VM {vm_name!r} already exists in this cluster on another host")
-        vm = inspect_vm(config, vm_name)
-        if interfaces_only:
+        try:
+            existing = remote.get(vm_name)
             if not existing:
-                raise NetBoxError(f"VM {vm_name!r} is missing in NetBox; full adopt is needed first")
-            record = get_vm(config, vm_name, cluster_id, device_id)
-            normalize_vm_interface_names(config, record, vm, dry_run)
-            continue
-        if existing:
-            record = get_vm(config, vm_name, cluster_id, device_id)
-            reconcile_adopted_vm(config, record, vm, dry_run)
-        elif dry_run:
-            validate_import_vm(vm)
-            print(f"WOULD IMPORT {vm_name}: {vm['vcpus']} vCPU, {vm['memory_mb']} MiB, "
-                  f"{len(vm['disks'])} disk(s), {len(vm['interfaces'])} interface(s), "
-                  f"{len(vm.get('mounted_media', []))} ISO/media")
-        else:
-            record = import_vm(config, vm, cluster_id, device_id)
-            print(f"IMPORTED {vm_name} as NetBox VM {record['id']}")
-    print(f"Adoption: {len(names)} VM(s) processed")
-    return 0
+                duplicate = find_vm(config, vm_name, cluster_id)
+                if duplicate:
+                    raise NetBoxError(f"VM {vm_name!r} already exists in this cluster on another host")
+            vm = inspect_vm(config, vm_name)
+            if interfaces_only:
+                if not existing:
+                    raise NetBoxError(f"VM {vm_name!r} is missing in NetBox; full adopt is needed first")
+                record = get_vm(config, vm_name, cluster_id, device_id)
+                normalize_vm_interface_names(config, record, vm, dry_run)
+            elif existing:
+                record = get_vm(config, vm_name, cluster_id, device_id)
+                reconcile_adopted_vm(config, record, vm, dry_run)
+            elif dry_run:
+                validate_import_vm(vm)
+                print(f"WOULD IMPORT {vm_name}: {vm['vcpus']} vCPU, {vm['memory_mb']} MiB, "
+                      f"{len(vm['disks'])} disk(s), {len(vm['interfaces'])} interface(s), "
+                      f"{len(vm.get('mounted_media', []))} ISO/media")
+            else:
+                record = import_vm(config, vm, cluster_id, device_id)
+                print(f"IMPORTED {vm_name} as NetBox VM {record['id']}")
+        except VM_OPERATION_ERRORS as error:
+            failures += 1
+            print(f"ERROR {vm_name}: {error}", file=sys.stderr)
+    print(f"Adoption: {len(names)} VM(s), {len(names) - failures} successful, {failures} failure(s)")
+    return 1 if failures else 0
 
 
 def doctor(config: dict) -> int:
@@ -1340,7 +1346,8 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
         if args.command == "sync" and desired_status == "active" and not args.dry_run:
             reconcile_power(config, record, desired_status)
     except (OSError, tomllib.TOMLDecodeError, ValueError, NetBoxError, subprocess.CalledProcessError) as error:
-        print(f"{args.command} failed: {error}", file=sys.stderr)
+        target = getattr(args, "vm", None) or getattr(args, "spec", None)
+        print(f"{args.command} {target} failed: {error}", file=sys.stderr)
         if has_netbox_key(config):
             print("NetBox remains the source of truth; inspect its VM record before retrying.", file=sys.stderr)
         if reserved_name:
@@ -1369,8 +1376,12 @@ def sync_all(config: dict, args: argparse.Namespace) -> int:
     for name in names:
         print(f"\n== {name} ==", flush=True)
         vm_args = argparse.Namespace(**{**vars(args), "vm": name})
-        failures += provision_command(config, vm_args) != 0
-    print(f"Sync: {len(names)} VM(s), {failures} failure(s)")
+        try:
+            failures += provision_command(config, vm_args) != 0
+        except VM_OPERATION_ERRORS as error:
+            failures += 1
+            print(f"sync {name} failed: {error}", file=sys.stderr)
+    print(f"Sync: {len(names)} VM(s), {len(names) - failures} successful, {failures} failure(s)")
     return 1 if failures else 0
 
 

@@ -28,7 +28,20 @@ class SyncAllTests(unittest.TestCase):
         records.assert_called_once_with(self.config, 12)
         self.assertEqual([item.args[1].vm for item in provision.call_args_list], ["alpha", "zeta"])
         self.assertTrue(all(item.args[1].dry_run for item in provision.call_args_list))
-        self.assertIn("Sync: 2 VM(s), 1 failure(s)", output.getvalue())
+        self.assertIn("Sync: 2 VM(s), 1 successful, 1 failure(s)", output.getvalue())
+
+    def test_sync_continues_after_vm_exception(self):
+        with (
+            patch("vmctl.find_device", return_value=(12, 7)),
+            patch("vmctl.list_vms", return_value=[{"name": "alpha"}, {"name": "zeta"}]),
+            patch("vmctl.provision_command", side_effect=[ValueError("bad VM"), 0]) as provision,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(vmctl.sync_all(self.config, self.args), 1)
+        self.assertEqual([item.args[1].vm for item in provision.call_args_list], ["alpha", "zeta"])
+        self.assertIn("sync alpha failed: bad VM", errors.getvalue())
+        self.assertIn("1 successful, 1 failure(s)", output.getvalue())
 
     def test_missing_key_stops_before_host_or_local_access(self):
         with (

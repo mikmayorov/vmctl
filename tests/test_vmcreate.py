@@ -463,6 +463,29 @@ class OperationOrderTests(unittest.TestCase):
         inspect.assert_called_once_with(config, "chosen")
         imported.assert_called_once()
 
+    def test_adopt_continues_after_one_vm_fails(self):
+        config = {"netbox": {"key": "secret"}}
+        vm = {"name": "good", "vcpus": 2, "memory_mb": 2048,
+              "disks": [], "interfaces": [], "mounted_media": []}
+        def inspect(_config, name):
+            if name == "bad":
+                raise ValueError("invalid local XML")
+            return vm
+        with (
+            patch("vmctl.find_device", return_value=(12, 7)),
+            patch("vmctl.list_vms", return_value=[]),
+            patch("vmctl.local_names", return_value=["bad", "good"]),
+            patch("vmctl.find_vm", return_value=None),
+            patch("vmctl.inspect_vm", side_effect=inspect),
+            patch("vmctl.import_vm", return_value={"id": 5}) as imported,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(vmctl.adopt(config, False), 1)
+        imported.assert_called_once()
+        self.assertIn("ERROR bad: invalid local XML", errors.getvalue())
+        self.assertIn("Adoption: 2 VM(s), 1 successful, 1 failure(s)", output.getvalue())
+
     def test_audit_reports_missing_and_different_vms(self):
         config = {"netbox": {"key": "secret"}}
         with (
