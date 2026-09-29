@@ -17,7 +17,7 @@ from pathlib import Path
 
 from netbox import (
     NetBoxError, COMPONENT_NAME, _request, add_component, create_vm_components, ensure_primary_mac,
-    find_device, find_vm, get_vm, has_netbox_key, import_vm, reconcile_adopted_vm, interface_ips, interface_macs, list_vms,
+    find_device, find_vm, get_vm, has_netbox_key, host_interface_description, import_vm, reconcile_adopted_vm, interface_ips, interface_macs, list_vms,
     local_spec_from_netbox, normalize_vm_interface_names, patch_vm, remove_component, reserve_vm, validate_import_vm, vm_disks, vm_interfaces,
     vm_serial_uuid,
 )
@@ -508,22 +508,32 @@ def component_command(config: dict, args: argparse.Namespace) -> int:
                                                "name": component_name, "size": args.size_gb * 1024,
                                                "description": str(candidate)})
             elif kind == "nic":
+                created = not found
+                entry = None
+                if context.get("version") == 4:
+                    previous = (context.get("interfaces") or {}).get(component_name) or {}
+                    entry = {
+                        "host_dev": previous.get("host_dev") or host_interface_name(name, component_name),
+                        "bridge": bridge or previous.get("bridge") or config["network"]["bridge"],
+                    }
                 if not found:
-                    found = add_component(config, "nic", {"virtual_machine": record["id"],
-                                                          "name": component_name, "enabled": True})
+                    payload = {"virtual_machine": record["id"], "name": component_name, "enabled": True}
+                    if entry:
+                        payload["description"] = host_interface_description(entry["host_dev"], entry["bridge"])
+                    found = add_component(config, "nic", payload)
                 ensure_primary_mac(config, found, mac)
                 if context.get("version") == 4:
                     context_data = record.get("local_context_data") or {}
                     context = dict(context)
                     layout = dict(context.get("interfaces") or {})
-                    layout[component_name] = {
-                        "host_dev": layout.get(component_name, {}).get("host_dev") or
-                                    host_interface_name(name, component_name),
-                        "bridge": bridge or layout.get(component_name, {}).get("bridge") or
-                                  config["network"]["bridge"],
-                    }
+                    layout[component_name] = entry
                     context["interfaces"] = layout
                     patch_vm(config, record["id"], {"local_context_data": {**context_data, "vmctl": context}})
+                    description = host_interface_description(entry["host_dev"], entry["bridge"])
+                    if not created and (found.get("description") in (None, "") or
+                            str(found["description"]).startswith("Host interface: ")) and found.get("description") != description:
+                        _request(config, "PATCH", f"virtualization/interfaces/{found['id']}/",
+                                 {"description": description})
                 elif bridge:
                     context_data = record.get("local_context_data") or {}
                     context = dict(context_data.get("vmctl") or {})

@@ -334,7 +334,8 @@ class NetBoxTests(unittest.TestCase):
               patch("netbox.ensure_primary_mac") as mac):
             netbox.create_vm_components({"storage": {"directory": "/images"}}, record, "eth0")
         self.assertIn(("POST", "virtualization/interfaces/", {
-            "virtual_machine": 42, "name": "eth0", "enabled": True}), requests)
+            "virtual_machine": 42, "name": "eth0", "enabled": True,
+            "description": f"Host interface: {host_interface_name('test-vm', 'eth0')}; bridge: br1"}), requests)
         mac.assert_called_once()
 
     def test_components_are_created_before_local_vm(self):

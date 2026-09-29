@@ -44,6 +44,24 @@ class AdoptReconcileTests(unittest.TestCase):
         self.assertEqual(data["version"], 4)
         self.assertEqual(data["interfaces"], {"inet": {"host_dev": tap, "bridge": "br0"}})
         self.assertNotIn("interface_bridges", data)
+        request.assert_called_once_with({}, "PATCH", "virtualization/interfaces/8/", {
+            "description": f"Host interface: {tap}; bridge: br0"})
+
+    def test_interface_only_migration_keeps_handwritten_description(self):
+        tap = host_interface_name("guest", "inet")
+        record = {"id": 42, "name": "guest", "local_context_data": {"vmctl": {
+            "version": 4, "source": "existing",
+            "interfaces": {"inet": {"host_dev": tap, "bridge": "br0"}}}}}
+        vm = {"name": "guest", "interfaces": [{"name": "inet", "host_dev": tap,
+              "bridge": "br0", "mac_address": "52:54:00:00:00:01"}]}
+        nic = {"id": 8, "name": "inet", "description": "Administrator note",
+               "primary_mac_address": {"mac_address": "52:54:00:00:00:01"}}
+        with (patch("netbox.vm_interfaces", return_value=[nic]),
+              patch("netbox.patch_vm") as update,
+              patch("netbox._request") as request,
+              redirect_stdout(io.StringIO())):
+            self.assertFalse(netbox.normalize_vm_interface_names({}, record, vm, False))
+        update.assert_not_called()
         request.assert_not_called()
 
     def test_netbox_spec_excludes_iso_from_libvirt_writable_disks(self):

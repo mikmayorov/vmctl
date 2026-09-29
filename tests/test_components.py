@@ -86,6 +86,8 @@ class ComponentTests(unittest.TestCase):
               patch("vmctl.patch_vm") as update):
             self.assertEqual(vmctl.component_command(config, args), 0)
         self.assertEqual(add.call_args.args[2]["name"], "backup")
+        self.assertEqual(add.call_args.args[2]["description"],
+                         f"Host interface: {host_interface_name('guest', 'backup')}; bridge: br1")
         self.assertEqual(update.call_args.args[2]["local_context_data"]["vmctl"]["interfaces"]["backup"], {
             "host_dev": host_interface_name("guest", "backup"), "bridge": "br1"})
 

@@ -158,6 +158,11 @@ def vm_interfaces(config: dict, vm_id: int) -> list[dict]:
     return _list_results(config, f"virtualization/interfaces/?virtual_machine_id={vm_id}&limit=100")
 
 
+def host_interface_description(host_dev: str, bridge: str) -> str:
+    """Human-readable copy of the guest NIC's host-side mapping."""
+    return f"Host interface: {host_dev}; bridge: {bridge}"
+
+
 def interface_ips(config: dict, interface_id: int) -> list[dict]:
     return _list_results(config, "ipam/ip-addresses/?" + urllib.parse.urlencode({
         "assigned_object_type": "virtualization.vminterface",
@@ -255,12 +260,16 @@ def create_vm_components(config: dict, record: dict, interface_name: str | None 
         guest_name = next(iter(layout))
         if interface_name is not None and interface_name != guest_name:
             raise NetBoxError(f"prepared guest interface is {guest_name!r}, not {interface_name!r}")
+        entry = layout[guest_name]
+        description = host_interface_description(entry["host_dev"], entry["bridge"])
     else:
         guest_name = host_interface_name(record["name"], interface_name or "inet")
+        description = None
     interfaces = vm_interfaces(config, vm_id)
     if not interfaces:
         interface = _request(config, "POST", "virtualization/interfaces/", {
             "virtual_machine": vm_id, "name": guest_name, "enabled": True,
+            **({"description": description} if description else {}),
         })
     else:
         interface = next((item for item in interfaces if item["name"] in (guest_name, interface_name)), None)
@@ -313,18 +322,27 @@ def normalize_vm_interface_names(config: dict, record: dict, vm: dict, dry_run: 
     new_context.pop("interface_bridges", None)
     new_context.pop("interface_name", None)
     new_context.pop("bridge", None)
-    if new_context == context:
+    descriptions = [(item, host_interface_description(target, bridge))
+                    for item, target, bridge in plan
+                    if not item.get("description") or item["description"].startswith("Host interface: ")
+                    if item.get("description") != host_interface_description(target, bridge)]
+    if new_context == context and not descriptions:
         print(f"UNCHANGED {vm['name']} interfaces")
         return False
     print(f"{'WOULD UPDATE' if dry_run else 'UPDATED'} {vm['name']} interface context; VM Interface names and IPs stay assigned")
     for item, target, bridge in plan:
         print(f"  MAP {item['name']} → {target} @ {bridge}")
+    for item, description in descriptions:
+        print(f"  DESCRIPTION {item['name']}: {description}")
     if dry_run:
         return True
-    patch_vm(config, record["id"], {
-        "local_context_data": {**data, "vmctl": new_context},
-        "changelog_message": "vmctl recorded guest-to-host interface mappings",
-    })
+    if new_context != context:
+        patch_vm(config, record["id"], {
+            "local_context_data": {**data, "vmctl": new_context},
+            "changelog_message": "vmctl recorded guest-to-host interface mappings",
+        })
+    for item, description in descriptions:
+        _request(config, "PATCH", f"virtualization/interfaces/{item['id']}/", {"description": description})
     return True
 
 
@@ -401,8 +419,11 @@ def import_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
                                        "name": item["name"], "size": item["size_mb"],
                                        "description": item["path"]})
     for item in named_interfaces:
+        mapping = interface_layout[item["name"]]
         interface = add_component(config, "nic", {"virtual_machine": record["id"],
-                                                 "name": item["name"], "enabled": True})
+                                                 "name": item["name"], "enabled": True,
+                                                 "description": host_interface_description(
+                                                     mapping["host_dev"], mapping["bridge"])})
         ensure_primary_mac(config, interface, item["mac_address"])
     return record
 
@@ -606,7 +627,11 @@ def reconcile_adopted_vm(config: dict, record: dict, vm: dict, dry_run: bool) ->
         remove_component(config, "disk", item["id"])
     for local, match, name in nic_changes:
         if match is None:
-            match = add_component(config, "nic", {"virtual_machine": vm_id, "name": name, "enabled": True})
+            mapping = layout[name]
+            match = add_component(config, "nic", {"virtual_machine": vm_id, "name": name,
+                                                  "enabled": True,
+                                                  "description": host_interface_description(
+                                                      mapping["host_dev"], mapping["bridge"])})
         primary = match.get("primary_mac_address")
         if primary and primary.get("mac_address", "").lower() != local["mac_address"].lower():
             _request(config, "PATCH", f"dcim/mac-addresses/{primary['id']}/", {"mac_address": local["mac_address"]})
