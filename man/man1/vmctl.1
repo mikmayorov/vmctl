@@ -245,7 +245,31 @@ API-токен NetBox; файл доступен только владельцу
 .TP
 .B /opt/vmctl/examples/ubuntu-iso.toml
 Пример запроса на создание ВМ из ISO.
-.SH СМ. ТАКЖЕ
+.SH AUTHOR
+Михаил Майоров:
+.UR https://github.com/mikmayorov
+https://github.com/mikmayorov
+.UE
+.PP
+Проект и исходный код:
+.UR https://github.com/mikmayorov/vmctl
+https://github.com/mikmayorov/vmctl
+.UE
+.SH SEE ALSO
+.BR python3 (1),
+.BR virsh (1),
+.BR qemu-img (1),
+.BR xorriso (1).
+.PP
+.B python3
+запускает vmctl;
+.B virsh
+управляет libvirt;
+.B qemu-img
+создаёт и проверяет диски.
+.B xorriso
+есть в коде будущего сценария cloud image, который в этом релизе отключён.
+.PP
 Полное руководство по установке, NetBox и libvirt:
 .BR /opt/vmctl/README.md .
 Для краткой справки используйте
