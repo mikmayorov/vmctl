@@ -31,6 +31,64 @@ VM_OPERATION_ERRORS = (NetBoxError, ValueError, OSError, KeyError, TypeError,
                        subprocess.CalledProcessError)
 
 
+def error_hint(error: Exception, command: str, name: str | None = None) -> str:
+    """Give the operator one concrete next check without changing either system."""
+    detail = str(error).lower()
+    target = name or "ИМЯ"
+    if "cloud_image is not available" in detail:
+        if command == "sync":
+            return ("Создание из cloud image пока не поддерживается. Проверьте эту запись ВМ в NetBox; "
+                    "для новой ВМ подготовьте запрос с source='iso'.")
+        return "Используйте запрос source='iso' с существующим ISO; cloud image запланирован для следующего релиза."
+    if "cannot match netbox interface" in detail or "no netbox interface with guest mac" in detail:
+        return (f"Сверьте MAC гостя через virsh dumpxml --inactive {target} с Primary MAC VM Interface в NetBox. "
+                "Назначьте правильный Primary MAC; если интерфейс лишний, сначала снимите с него IP в NetBox IPAM. "
+                f"Затем повторите vmctl --dry-run adopt {target}.")
+    if "interface counts differ" in detail:
+        return (f"Сравните интерфейсы в virsh dumpxml --inactive {target} и в NetBox. "
+                f"Для добавления или удаления компонентов используйте полный vmctl --dry-run adopt {target}.")
+    if "serial" in detail and ("differs" in detail or "empty" in detail or "uuid" in detail):
+        return (f"Сравните virsh domuuid {target} с полем Serial ВМ в NetBox; "
+                "исправляйте Serial только после проверки, что это та же ВМ.")
+    if "primary mac" in detail or "netbox mac" in detail or "assigned mac" in detail:
+        return (f"Проверьте Primary MAC и назначенные MAC-объекты VM Interface в NetBox; "
+                f"сверьте адрес гостя с virsh dumpxml --inactive {target}.")
+    if "http 401" in detail or "http 403" in detail:
+        return "Проверьте API-токен NetBox и права его пользователя на ВМ, компоненты и Device хоста."
+    if "http 400" in detail:
+        return "Проверьте обязательные поля и ограничения прав в форме объекта NetBox; затем повторите пробную команду."
+    if "device" in detail and ("site" in detail or "cluster" in detail or "expected one" in detail):
+        return "Проверьте netbox.device/netbox.site в config.toml и привязку Device к кластеру в NetBox."
+    if "bridge" in detail or "host tap" in detail:
+        return (f"Проверьте мост командой ip link show и запись vmctl.interfaces для ВМ {target} "
+                "в Context NetBox; указанный мост должен существовать на хосте.")
+    if "iso file is missing" in detail or "iso path" in detail or "media virtual disk" in detail:
+        return "Проверьте путь ISO в Description соответствующего Virtual Disk NetBox и наличие файла на хосте."
+    if "disk" in detail and ("differs" in detail or "missing" in detail):
+        return ("Сверьте размер и полный путь в NetBox Virtual Disk (Description) с файлом на хосте "
+                "через ls -l и qemu-img info; vmctl не меняет размер существующего диска автоматически.")
+    if "unsupported libvirt storage or interface" in detail:
+        return (f"Изучите virsh dumpxml --inactive {target}: adopt понимает обычные диски и bridge-интерфейсы. "
+                "Исправьте неподдерживаемый компонент вручную после проверки ВМ.")
+    if "lacks name, vcpus, memory or disk" in detail or "no supported vmctl context" in detail:
+        return (f"Заполните обязательные поля ВМ в NetBox или импортируйте локальную ВМ через "
+                f"vmctl --dry-run adopt {target}, затем vmctl adopt {target}.")
+    if "missing locally" in detail or ("does not exist" in detail and command == "sync"):
+        return (f"Проверьте virsh list --all. Если ВМ существовала раньше, восстановите её XML/диски; "
+                "новую ВМ создавайте из подготовленной записи NetBox.")
+    if command == "adopt":
+        return f"Проверьте virsh dumpxml --inactive {target} и запись ВМ в NetBox; затем vmctl --dry-run adopt {target}."
+    if command == "sync":
+        return f"Сравните NetBox, XML и память через vmctl check {target}; затем vmctl --dry-run sync {target}."
+    if name:
+        return f"Проверьте vmctl check {target} и vmctl audit перед повтором команды."
+    return "Проверьте vmctl check, настройки config.toml и доступность libvirt/NetBox."
+
+
+def print_error_hint(error: Exception, command: str, name: str | None = None) -> None:
+    print(f"Что сделать: {error_hint(error, command, name)}", file=sys.stderr)
+
+
 def refresh_guest_links(config: dict, names: list[str] | None = None,
                         project_dir: Path | None = None) -> int:
     """Point current-guest entries at libvirt's persistent domain XML files."""
@@ -189,11 +247,11 @@ def build_parser() -> argparse.ArgumentParser:
     cat_cmd.add_argument("vm", metavar="ИМЯ", help="Имя локальной ВМ")
     cat_cmd.add_argument("--live", action="store_true", help="Показать текущий XML работающей ВМ вместо постоянного")
 
-    prepare = add("prepare", "Создать запись ВМ, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
+    prepare = add("prepare", "Подготовить ВМ из ISO: создать запись, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
                   "vmctl prepare local/guest.toml",
                   details="После prepare можно назначить IP в NetBox IPAM, настроить дисплей и изменить параметры ВМ. Затем выполните vmctl sync ИМЯ.")
     prepare.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
-    create = add("create", "При наличии ключа выполнить prepare и первый sync за один вызов: сначала запись и компоненты в NetBox, затем локальная ВМ из этой записи. Между этапами нет паузы для правок в NetBox. Без ключа создаёт ВМ только локально; ВМ не запускает.",
+    create = add("create", "Создать ВМ из ISO. При наличии ключа выполнить prepare и первый sync за один вызов: сначала запись и компоненты в NetBox, затем локальная ВМ из этой записи. Между этапами нет паузы для правок в NetBox. Без ключа создаёт ВМ только локально; ВМ не запускает.",
                  "vmctl create local/guest.toml",
                  details="Если нужно назначить IP или изменить дисплей до создания локальной ВМ, используйте prepare, затем правки в NetBox и sync.")
     create.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
@@ -307,7 +365,11 @@ def resolve_creation_spec(data: dict, config: dict) -> dict:
     if not isinstance(vm, dict):
         raise ValueError("VM spec needs a [vm] table")
     if "software" in vm:
-        raise ValueError("vm.software is reserved until software images are implemented; use source and iso/image")
+        raise ValueError("vm.software is not available in this release; create the VM from an ISO")
+    if vm.get("source") == "cloud_image":
+        raise ValueError("cloud_image is not available in this release; use source='iso' and an ISO file")
+    if vm.get("source") != "iso":
+        raise ValueError("vm.source must be 'iso' in this release")
     hardware_name = vm.get("hardware")
     if hardware_name is None:
         return validate_spec(data)
@@ -409,6 +471,7 @@ def show_list(config: dict) -> int:
         except VM_OPERATION_ERRORS as error:
             failed = True
             print(f"{name}: не удалось прочитать параметры: {error}", file=sys.stderr)
+            print_error_hint(error, "list", name)
             rows.append((name, *("-" for _ in range(len(headings) - 1))))
 
     widths = [max(len(str(row[index])) for row in (headings, *rows)) for index in range(len(headings))]
@@ -698,6 +761,7 @@ def audit(config: dict) -> int:
                     problems += 1
             except NetBoxError as error:
                 print(f"INVALID {name}: {error}")
+                print_error_hint(error, "audit", name)
                 problems += 1
             status = vm.get("status")
             status = status.get("value") if isinstance(status, dict) else status
@@ -711,10 +775,10 @@ def audit(config: dict) -> int:
             if status in ("active", "offline"):
                 expected["status"] = status
             context = (vm.get("local_context_data") or {}).get("vmctl") or {}
-            supported_context = context.get("version") in (1, 2, 3, 4) and context.get("source") in ("iso", "cloud_image", "existing")
+            supported_context = context.get("version") in (1, 2, 3, 4) and context.get("source") in ("iso", "existing")
             pending_restart = False
             if not supported_context:
-                print(f"INVALID {name}: NetBox VM has no supported vmctl context")
+                print(f"INVALID {name}: NetBox VM has no supported vmctl context (release supports ISO and adopted VMs)")
                 problems += 1
             else:
                 if context["version"] in (2, 3, 4):
@@ -745,7 +809,7 @@ def audit(config: dict) -> int:
                                         for item in spec.get("mounted_media", [])]
                         observed_media = [{key: item[key] for key in ("path", "target", "size_mb") if key in item}
                                           for item in local.get("mounted_media", [])]
-                        if not pending_restart and context.get("source") != "cloud_image" and wanted_media != observed_media:
+                        if not pending_restart and wanted_media != observed_media:
                             print(f"DIFF {name} mounted media: NetBox and local CD-ROM sources differ")
                             problems += 1
                         wanted_nics = {(item["bridge"], item["mac_address"].lower()) for item in spec["interfaces"]}
@@ -756,12 +820,13 @@ def audit(config: dict) -> int:
                             problems += 1
                     except NetBoxError as error:
                         print(f"INVALID {name}: {error}")
+                        print_error_hint(error, "audit", name)
                         problems += 1
                 if context.get("bridge") is not None and context["version"] == 1:
                     expected["bridge"] = context["bridge"]
                 if context.get("disk_paths") is not None and context["version"] == 1:
                     expected["disk_paths"] = context["disk_paths"]
-                elif context["version"] == 1 and context["source"] in ("iso", "cloud_image"):
+                elif context["version"] == 1 and context["source"] == "iso":
                     directory = context.get("storage_directory")
                     if not isinstance(directory, str):
                         raise ValueError("NetBox VM has no storage_directory")
@@ -778,6 +843,7 @@ def audit(config: dict) -> int:
                     problems += 1
         except VM_OPERATION_ERRORS as error:
             print(f"INVALID {name}: {error}")
+            print_error_hint(error, "audit", name)
             problems += 1
     print(f"Audit: {len(names)} local, {len(remote)} NetBox, {problems} issue(s)")
     return 1 if problems else 0
@@ -823,6 +889,7 @@ def adopt(config: dict, dry_run: bool, name: str | None = None, interfaces_only:
         except VM_OPERATION_ERRORS as error:
             failures += 1
             print(f"ERROR {vm_name}: {error}", file=sys.stderr)
+            print_error_hint(error, "adopt", vm_name)
     print(f"Adoption: {len(names)} VM(s), {len(names) - failures} successful, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -834,11 +901,13 @@ def doctor(config: dict) -> int:
             print(f"OK {binary}")
         else:
             print(f"MISSING {binary}")
+            print(f"Что сделать: установите пакет с {binary} и проверьте command -v {binary}.")
             problems += 1
     try:
         print(f"OK libvirt: {len(local_names(config))} VM(s)")
     except (OSError, subprocess.CalledProcessError) as error:
         print(f"ERROR libvirt: {error}")
+        print(f"Что сделать: проверьте virsh -c {config['host']['libvirt_uri']} list --all и состояние службы libvirt.")
         problems += 1
     storage = config.get("storage", {}).get("directory")
     bridge = config.get("network", {}).get("bridge")
@@ -846,11 +915,13 @@ def doctor(config: dict) -> int:
         print(f"OK storage: {storage}")
     else:
         print(f"ERROR storage directory: {storage!r}")
+        print("Что сделать: проверьте storage.directory в config.toml и наличие каталога на хосте.")
         problems += 1
     if isinstance(bridge, str) and (Path("/sys/class/net") / bridge / "bridge").is_dir():
         print(f"OK bridge: {bridge}")
     else:
         print(f"ERROR network bridge: {bridge!r}")
+        print("Что сделать: проверьте network.bridge в config.toml и ip link show на хосте.")
         problems += 1
     if has_netbox_key(config):
         try:
@@ -860,6 +931,7 @@ def doctor(config: dict) -> int:
             print("OK NetBox VM read access")
         except NetBoxError as error:
             print(f"ERROR NetBox: {error}")
+            print(f"Что сделать: {error_hint(error, 'check')}")
             problems += 1
     else:
         print("LOCAL ONLY: no NetBox key; VM inventory is not documented in NetBox")
@@ -880,11 +952,13 @@ def check_host(config: dict) -> int:
             )
             if completed.returncode:
                 print(completed.stderr.strip() or f"virsh {command} завершился с кодом {completed.returncode}")
+                print(f"Что сделать: проверьте virsh -c {uri} {command} вручную и состояние службы libvirt.")
                 result = 1
             else:
                 print(completed.stdout.rstrip() or "Нет записей")
         except OSError as error:
             print(f"Ошибка: {error}")
+            print(f"Что сделать: проверьте наличие virsh и соединение {uri}.")
             result = 1
     return result
 
@@ -1094,6 +1168,7 @@ def check_vm(config: dict, name: str) -> int:
     _check_heading(name, status)
     if netbox_error:
         print(f"NetBox: {netbox_error}")
+        print(f"Что сделать: {error_hint(NetBoxError(netbox_error), 'check', name)}")
     if pending:
         print("Ожидают перезапуска: " + ", ".join(pending))
     if netbox_diffs:
@@ -1241,8 +1316,10 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
             require_netbox(config)
             device_id, cluster_id = find_device(config)
             record = get_vm(config, args.vm, cluster_id, device_id)
-            serial = verify_vm_serial(config, record, args.vm in local_names(config))
             context = (record.get("local_context_data") or {}).get("vmctl") or {}
+            if context.get("source") == "cloud_image":
+                raise NetBoxError("cloud_image is not available in this release; do not sync this VM yet")
+            serial = verify_vm_serial(config, record, args.vm in local_names(config))
             if context.get("delete_requested"):
                 raise NetBoxError("VM deletion is pending; retry vmctl delete instead of sync")
             missing_macs = [item for item in vm_interfaces(config, record["id"])
@@ -1254,6 +1331,8 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
             for item in missing_macs:
                 ensure_primary_mac(config, item)
         vm = local_spec_from_netbox(record, config)
+        if vm["source"] not in ("iso", "existing"):
+            raise NetBoxError("NetBox vmctl.source must be 'iso' or 'existing' in this release")
         if vm["source"] == "existing":
             if args.command != "sync":
                 raise NetBoxError("existing VM records cannot be used as creation requests")
@@ -1348,6 +1427,7 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
     except (OSError, tomllib.TOMLDecodeError, ValueError, NetBoxError, subprocess.CalledProcessError) as error:
         target = getattr(args, "vm", None) or getattr(args, "spec", None)
         print(f"{args.command} {target} failed: {error}", file=sys.stderr)
+        print_error_hint(error, args.command, str(target) if target else None)
         if has_netbox_key(config):
             print("NetBox remains the source of truth; inspect its VM record before retrying.", file=sys.stderr)
         if reserved_name:
@@ -1366,6 +1446,7 @@ def sync_all(config: dict, args: argparse.Namespace) -> int:
             raise NetBoxError("multiple VM records with the same name are assigned to this host")
     except (NetBoxError, ValueError, OSError) as error:
         print(f"sync failed: {error}", file=sys.stderr)
+        print_error_hint(error, "sync")
         return 1
 
     if not names:
@@ -1381,6 +1462,7 @@ def sync_all(config: dict, args: argparse.Namespace) -> int:
         except VM_OPERATION_ERRORS as error:
             failures += 1
             print(f"sync {name} failed: {error}", file=sys.stderr)
+            print_error_hint(error, "sync", name)
     print(f"Sync: {len(names)} VM(s), {len(names) - failures} successful, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -1391,6 +1473,7 @@ def main() -> int:
         config = load_config(args.config)
     except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
         print(f"Configuration error: {error}", file=sys.stderr)
+        print_error_hint(error, "config")
         return 2
 
     if args.command in ("disk", "nic", "delete"):
@@ -1401,6 +1484,7 @@ def main() -> int:
             return result
         except (NetBoxError, ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"{args.command} failed: {error}", file=sys.stderr)
+            print_error_hint(error, args.command, args.vm)
             if has_netbox_key(config):
                 print("NetBox remains the source of truth; run vmctl audit and retry sync or delete.", file=sys.stderr)
             return 1
@@ -1417,6 +1501,7 @@ def main() -> int:
             return result
         except (NetBoxError, ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"{args.command} failed: {error}", file=sys.stderr)
+            print_error_hint(error, args.command, getattr(args, "vm", None))
             return 1
 
     if args.command == "list":
@@ -1424,6 +1509,7 @@ def main() -> int:
             return show_list(config)
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"list failed: {error}", file=sys.stderr)
+            print_error_hint(error, "list")
             return 1
 
     if args.command == "cat":
@@ -1432,6 +1518,7 @@ def main() -> int:
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
             print(f"cat failed: {detail}", file=sys.stderr)
+            print_error_hint(error, "cat", args.vm)
             return 1
 
     if args.command == "shutdown":
@@ -1439,6 +1526,7 @@ def main() -> int:
             return shutdown_vm(config, args.vm, args.force, args.dry_run)
         except (NetBoxError, OSError, subprocess.CalledProcessError) as error:
             print(f"shutdown failed: {error}", file=sys.stderr)
+            print_error_hint(error, "shutdown", args.vm)
             if has_netbox_key(config):
                 print("NetBox remains the source of truth; check vmctl audit and retry.", file=sys.stderr)
             return 1
@@ -1482,11 +1570,13 @@ def main() -> int:
             })
         except NetBoxError as error:
             print(f"NetBox update failed; local command was not run: {error}", file=sys.stderr)
+            print_error_hint(error, args.command, args.vm)
             return 1
     try:
         result = subprocess.run(command, check=False).returncode
         if result and netbox_changes and has_netbox_key(config):
             print("Local command failed after NetBox was updated; reconcile this VM.", file=sys.stderr)
+            print_error_hint(ValueError(f"virsh exited with status {result}"), args.command, args.vm)
         return result
     except FileNotFoundError:
         print("virsh is not installed on this host", file=sys.stderr)
