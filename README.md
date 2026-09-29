@@ -20,6 +20,8 @@ cd /opt/vmctl
 cp config.example.toml config.toml
 chmod 600 config.toml
 ln -s /opt/vmctl/vmctl /usr/local/bin/vmctl
+mkdir -p /usr/local/share/man/man1
+ln -s /opt/vmctl/man/man1/vmctl.1 /usr/local/share/man/man1/vmctl.1
 ```
 
 В `config.toml` проверьте `host.libvirt_uri`, `storage.directory` и `network.bridge`. Каталог и мост должны существовать. Секция `[hardware.*]` задаёт предлагаемые размеры ВМ: `vcpus`, `memory_mb`, `disk_gb` (ГиБ = 2³⁰ байт). Имя профиля выбирается в файле запроса: `hardware = "small"`.
@@ -30,9 +32,10 @@ ln -s /opt/vmctl/vmctl /usr/local/bin/vmctl
 vmctl check                 # инструменты, libvirt, хранилище, мост, пулы и сети
 vmctl list                  # список ВМ хоста
 vmctl -h                    # краткая справка; vmctl КОМАНДА -h — параметры
+man vmctl                   # полное руководство по командам на русском
 ```
 
-Обновление: `cd /opt/vmctl && git pull --ff-only && vmctl check`. Файлы запросов ВМ удобно хранить в `local/`.
+Обновление: `cd /opt/vmctl && git pull --ff-only && vmctl check`. Ссылка на man-страницу при обновлении остаётся актуальной. Файлы запросов ВМ удобно хранить в `local/`.
 
 ## 2. Краткое использование без NetBox
 
@@ -158,7 +161,7 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 
 ## 4. Справочник команд vmctl
 
-Синтаксис: `vmctl [--config ФАЙЛ] [--dry-run] КОМАНДА ...`. `--config` выбирает другой файл конфигурации, `--dry-run` показывает план без записи. Точные аргументы: `vmctl КОМАНДА -h`, например `vmctl disk add -h`.
+Синтаксис: `vmctl [--config ФАЙЛ] [--dry-run] КОМАНДА ...`. `--config` выбирает другой файл конфигурации, `--dry-run` показывает план без записи. Полная справка: `man vmctl`; точные аргументы: `vmctl КОМАНДА -h`, например `vmctl disk add -h`.
 
 ### Просмотр и сверка
 
