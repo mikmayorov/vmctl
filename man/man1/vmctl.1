@@ -59,6 +59,11 @@ IP-адреса на интерфейсах
 .B vmctl check
 проверяет инструменты, соединение libvirt, хранилище, мост, NetBox,
 пулы и сети.
+Кроме virsh и qemu-img проверяются команды cloud-сценария: virt-install,
+xorriso, ip и одна из xorrisofs/genisoimage/mkisofs. Отсутствующие инструменты
+помечаются MISSING cloud images и дают ненулевой код даже при доступном NetBox.
+Подсказка установки учитывает дистрибутив хоста (Gentoo, Ubuntu/Debian, Arch).
+Подходящая UEFI firmware проверяется при создании XML через virt-install/libvirt.
 .B vmctl check ИМЯ
 сравнивает запись NetBox, постоянный XML следующего запуска и состояние
 работающей ВМ. Показывает ресурсы, MAC гостя, TAP и мост хоста, IP,

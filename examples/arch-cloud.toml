@@ -3,8 +3,11 @@
 # ШАГИ СОЗДАНИЯ (на хосте виртуализации, от root)
 #
 # 1. Подготовьте хост. Для Ubuntu/Debian-хоста:
-#      apt install virtinst xorriso ovmf
+#      apt install virtinst xorriso iproute2 ovmf
+#    Для Gentoo-хоста:
+#      emerge --ask app-emulation/virt-manager dev-libs/libisoburn sys-apps/iproute2 sys-firmware/edk2
 #      vmctl check
+#    check должен показать наличие virt-install, xorriso, ip и ISO-builder.
 #    В config.toml настройте libvirt, storage.directory, network.bridge и NetBox.
 #    Рабочий каталог дисков и мост должны существовать. Arch — гостевая ОС,
 #    переустанавливать хост не требуется. Используются q35, virtio,

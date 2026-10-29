@@ -3,8 +3,12 @@
 # ШАГИ СОЗДАНИЯ (на хосте виртуализации, команды от root)
 #
 # 1. Установите инструменты и проверьте конфигурацию хоста:
-#      apt install virtinst xorriso ovmf
+#    На Ubuntu/Debian-хосте:
+#      apt install virtinst xorriso iproute2 ovmf
+#    На Gentoo-хосте:
+#      emerge --ask app-emulation/virt-manager dev-libs/libisoburn sys-apps/iproute2 sys-firmware/edk2
 #      vmctl check
+#    check должен показать наличие virt-install, xorriso, ip и ISO-builder.
 #    В config.toml должны быть настроены libvirt, storage.directory, network.bridge
 #    и подключение к NetBox. Каталог дисков и сетевой мост должны существовать.
 #    Образ должен уже лежать по пути image ниже. Вариант amd64v3 требует CPU

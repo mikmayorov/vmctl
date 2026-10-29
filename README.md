@@ -14,6 +14,19 @@
 
 Нужны Linux с KVM, Python 3.11+, работающий libvirt с соединением `qemu:///system`, `virsh`, `qemu-img`, место для дисков и настроенный сетевой мост. Для `man vmctl` нужна утилита `man` и локаль UTF-8. Приведённые команды рассчитаны на `root`.
 
+Для cloud images дополнительно нужны `virt-install`, `xorriso`, `ip` и одна из команд `xorrisofs`/`genisoimage`/`mkisofs`, а для загрузки — UEFI firmware (OVMF/EDK II). Пакеты устанавливаются **на хост**, независимо от выбранной гостевой ОС:
+
+```bash
+# Ubuntu / Debian:
+apt install virtinst xorriso iproute2 ovmf
+# Gentoo:
+emerge --ask app-emulation/virt-manager dev-libs/libisoburn sys-apps/iproute2 sys-firmware/edk2
+# Arch Linux:
+pacman -S virt-install libisoburn iproute2 edk2-ovmf
+```
+
+В Gentoo `virt-install` входит в `app-emulation/virt-manager`; графический интерфейс для работы vmctl не требуется (пакет поддерживает USE `-gui`).
+
 ```bash
 git clone https://github.com/mikmayorov/vmctl.git /opt/vmctl
 cd /opt/vmctl
@@ -36,6 +49,8 @@ man vmctl                   # полное руководство по кома�
 ```
 
 Если терминал использует локаль `C`/`POSIX`, откройте страницу через `LANG=C.UTF-8 man vmctl`.
+
+`check` проверяет команды как базового, так и cloud-сценария. Отсутствующие cloud-инструменты выводятся как `MISSING cloud images: ...` и дают ненулевой код, даже если libvirt и NetBox доступны. Создание из ISO не требует этих дополнительных инструментов. Выбор подходящей UEFI firmware проверяет libvirt/virt-install при создании XML; наличие всех команд само по себе не проверяет firmware и загрузку гостя.
 
 Обновление: `cd /opt/vmctl && git pull --ff-only && vmctl check`. Ссылка на man-страницу при обновлении остаётся актуальной. Файлы запросов ВМ удобно хранить в `local/`.
 

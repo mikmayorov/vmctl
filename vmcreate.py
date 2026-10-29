@@ -4,6 +4,7 @@ import json
 import hashlib
 import ipaddress
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -14,6 +15,33 @@ from pathlib import Path
 
 
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+
+
+def cloud_dependency_status() -> list[tuple[str, bool]]:
+    """Executables shared by cloud-image preflight and host diagnostics."""
+    return [(tool, shutil.which(tool) is not None) for tool in ("virt-install", "xorriso", "ip")] + [
+        ("xorrisofs / genisoimage / mkisofs",
+         any(shutil.which(tool) is not None for tool in ("xorrisofs", "genisoimage", "mkisofs")))
+    ]
+
+
+def cloud_dependency_hint() -> str:
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    families = [release.get("ID", ""), *release.get("ID_LIKE", "").split()]
+    commands = {
+        "gentoo": "emerge --ask app-emulation/virt-manager dev-libs/libisoburn sys-apps/iproute2",
+        "debian": "apt install virtinst xorriso iproute2",
+        "ubuntu": "apt install virtinst xorriso iproute2",
+        "arch": "pacman -S virt-install libisoburn iproute2",
+    }
+    for family in families:
+        if family in commands:
+            return f"Установите инструменты cloud images: {commands[family]}."
+    return ("Установите virt-install, xorriso, ip (iproute2) и одну из команд "
+            "xorrisofs/genisoimage/mkisofs пакетным менеджером хоста.")
 
 
 def vm_disks(vm: dict, default_disk: Path) -> list[dict]:
@@ -468,6 +496,9 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
     print(f"Disk: {disk}")
     if seed:
         print(f"Cloud-init seed: {seed}")
+        missing = [tool for tool, available in cloud_dependency_status() if not available]
+        if missing:
+            raise ValueError("cloud image dependencies missing: " + ", ".join(missing))
     if dry_run:
         for command in disk_commands:
             print(shlex.join(command))
@@ -525,12 +556,6 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
     if vm["name"] in existing.stdout.splitlines():
         raise ValueError(f"VM already exists in libvirt: {vm['name']}")
 
-    if seed and shutil.which("xorriso") is None:
-        raise ValueError("xorriso is required for cloud images")
-    if seed and shutil.which("virt-install") is None:
-        raise ValueError("virt-install is required for cloud images")
-    if seed and not any(shutil.which(tool) for tool in ("xorrisofs", "genisoimage", "mkisofs")):
-        raise ValueError("virt-install --cloud-init needs xorrisofs, genisoimage or mkisofs")
     if seed:
         info = subprocess.run(
             ["qemu-img", "info", "--output=json", str(source_path)],

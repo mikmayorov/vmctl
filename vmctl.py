@@ -23,7 +23,7 @@ from netbox import (
 )
 from inventory import inspect_definition, inspect_display, inspect_vm, local_names
 from cloudinit import cloud_init_from_netbox
-from vmcreate import (NAME_RE, create_vm, host_interface_name, interface_alias, pending_purge_file, purge_pending,
+from vmcreate import (NAME_RE, cloud_dependency_hint, cloud_dependency_status, create_vm, host_interface_name, interface_alias, pending_purge_file, purge_pending,
                       redefine_vm, validate_spec, verify_local_vm)
 from vmdelete import delete_local_vm, purge_local_disks
 
@@ -46,6 +46,11 @@ def error_hint(error: Exception, command: str, name: str | None = None) -> str:
         return f"Для новой ВМ выполните vmctl --dry-run create {target}, затем vmctl create {target}."
     if command == "create" and "does not exist in netbox" in detail:
         return "Сначала выполните vmctl prepare ФАЙЛ.toml, настройте запись в NetBox и повторите create ИМЯ."
+    if ("cloud image dependencies missing" in detail or "is required for cloud images" in detail
+            or "virt-install --cloud-init needs" in detail
+            or (isinstance(error, FileNotFoundError)
+                and Path(error.filename or "").name in ("virt-install", "xorriso", "ip"))):
+        return f"{cloud_dependency_hint()} Затем выполните vmctl check и повторите vmctl create {target}."
     if "cloud-init" in detail or "cloud_init" in detail or "gateway" in detail:
         return ("Проверьте IP на всех VM Interfaces, Contacts с ролью coreroot и полем sshpublickey, "
                 "а также vmctl.cloud_init в Context ВМ/хоста/кластера. Для cloud image нужны virt-install, xorriso и UEFI (OVMF).")
@@ -893,6 +898,14 @@ def doctor(config: dict) -> int:
             print(f"MISSING {binary}")
             print(f"Что сделать: установите пакет с {binary} и проверьте command -v {binary}.")
             problems += 1
+    missing_cloud = []
+    for label, available in cloud_dependency_status():
+        print(f"{'OK' if available else 'MISSING'} cloud images: {label}")
+        if not available:
+            missing_cloud.append(label)
+    if missing_cloud:
+        print(f"Что сделать: {cloud_dependency_hint()}")
+        problems += len(missing_cloud)
     try:
         print(f"OK libvirt: {len(local_names(config))} VM(s)")
     except (OSError, subprocess.CalledProcessError) as error:
