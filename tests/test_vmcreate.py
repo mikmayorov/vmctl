@@ -389,7 +389,7 @@ class OperationOrderTests(unittest.TestCase):
             spec = Path(directory) / "vm.toml"
             spec.write_text('[vm]\nname="test-vm"\nsource="iso"\nmemory_mb=2048\n'
                             'vcpus=2\ndisk_gb=20\niso="/images/install.iso"\n')
-            args = Namespace(command="create", spec=spec, config=spec, dry_run=False)
+            args = Namespace(command="create", target=str(spec), config=spec, dry_run=False)
             config = {"host": {"libvirt_uri": "qemu:///system"},
                       "network": {"bridge": "br1"}, "storage": {"directory": "/images"}}
             with (
@@ -503,7 +503,7 @@ class OperationOrderTests(unittest.TestCase):
         with (
             patch("vmctl.find_device", return_value=(12, 7)),
             patch("vmctl.get_vm", return_value=record),
-            patch("vmctl.local_names", return_value=[]),
+            patch("vmctl.local_names", return_value=["guest"]),
             patch("vmctl.verify_vm_serial", side_effect=netbox.NetBoxError("invalid Serial")) as serial,
             patch("vmctl.ensure_primary_mac") as mac,
             patch("vmctl.create_vm") as local,
@@ -605,7 +605,7 @@ class OperationOrderTests(unittest.TestCase):
             vmctl.reconcile_power(config, record, "active")
         self.assertEqual(order, ["netbox", "virsh"])
 
-    def test_create_writes_netbox_before_local_vm(self):
+    def test_create_uses_prepared_netbox_without_reservation_or_components(self):
         with tempfile.TemporaryDirectory() as directory:
             spec = Path(directory) / "vm.toml"
             spec.write_text(
@@ -618,22 +618,26 @@ class OperationOrderTests(unittest.TestCase):
                 "vcpus": 2, "disk_gb": 20, "iso": "/images/install.iso",
                 "bridge": "br1", "storage_directory": "/images",
             }
-            args = Namespace(command="create", spec=spec, config=spec, dry_run=False)
+            args = Namespace(command="create", target="test-vm", config=spec, dry_run=False)
             config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
             with (
                 patch("vmctl.parse_args", return_value=args),
                 patch("vmctl.load_config", return_value=config),
                 patch("vmctl.find_device", return_value=(12, 7)),
-                patch("vmctl.reserve_vm", side_effect=lambda *a: order.append("netbox-create")),
+                patch("vmctl.reserve_vm") as reserve,
                 patch("vmctl.get_vm", return_value={"id": 42, "status": {"value": "planned"}}),
-                patch("vmctl.create_vm_components", side_effect=lambda *a: order.append("netbox-components")),
+                patch("vmctl.create_vm_components") as components,
+                patch("vmctl.local_names", return_value=[]),
+                patch("vmctl.verify_vm_serial", return_value="00000000-0000-0000-0000-000000000001"),
                 patch("vmctl.local_spec_from_netbox", return_value=local_spec),
-                patch("vmctl.create_vm", side_effect=lambda *a: order.append("local-create")),
+                patch("vmctl.create_vm", side_effect=lambda *a: (order.append("local-create") or 0)),
                 patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox-staged")),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(vmctl.main(), 0)
-            self.assertEqual(order, ["netbox-create", "netbox-components", "local-create", "netbox-staged"])
+            self.assertEqual(order, ["local-create", "netbox-staged"])
+            reserve.assert_not_called()
+            components.assert_not_called()
 
     def test_start_updates_netbox_before_virsh(self):
         order = []
@@ -650,7 +654,7 @@ class OperationOrderTests(unittest.TestCase):
             self.assertEqual(vmctl.main(), 0)
         self.assertEqual(order, ["netbox", "virsh"])
 
-    def test_sync_updates_netbox_before_local_create(self):
+    def test_sync_missing_local_vm_requires_explicit_create_without_writes(self):
         order = []
         args = Namespace(command="sync", vm="test-vm", config=Path("config.toml"), dry_run=False)
         config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
@@ -671,9 +675,11 @@ class OperationOrderTests(unittest.TestCase):
             patch("vmctl.patch_vm", side_effect=lambda *a: order.append("netbox")),
             patch("vmctl.create_vm", side_effect=lambda *a: order.append("local")),
             contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as errors,
         ):
-            self.assertEqual(vmctl.main(), 0)
-        self.assertEqual(order, ["netbox", "local", "netbox"])
+            self.assertEqual(vmctl.main(), 1)
+        self.assertEqual(order, [])
+        self.assertIn("vmctl create test-vm", errors.getvalue())
 
     def test_dry_run_sync_existing_vm_does_not_plan_creation(self):
         args = Namespace(command="sync", vm="test-vm", config=Path("config.toml"), dry_run=True)
@@ -755,12 +761,12 @@ class OperationOrderTests(unittest.TestCase):
                 '[vm]\nname="test-vm"\nsource="iso"\nmemory_mb=2048\n'
                 'vcpus=2\ndisk_gb=20\niso="/images/install.iso"\n', encoding="utf-8",
             )
-            args = Namespace(command="create", spec=spec, config=spec, dry_run=False)
+            args = Namespace(command="create", target="test-vm", config=spec, dry_run=False)
             with (
                 patch("vmctl.parse_args", return_value=args),
                 patch("vmctl.load_config", return_value={"netbox": {"key": "secret"}}),
                 patch("vmctl.find_device", return_value=(12, 7)),
-                patch("vmctl.reserve_vm", side_effect=netbox.NetBoxError("unavailable")),
+                patch("vmctl.get_vm", side_effect=netbox.NetBoxError("unavailable")),
                 patch("vmctl.create_vm") as local,
                 contextlib.redirect_stderr(io.StringIO()),
             ):

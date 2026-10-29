@@ -97,9 +97,9 @@ class CloudInitTests(unittest.TestCase):
         self.assertEqual(root.find("./devices/interface/alias").get("name"), vmcreate.interface_alias("eth0"))
         self.assertEqual(root.findtext("on_reboot"), "restart")
 
-    def test_dry_run_new_cloud_vm_reads_keys_and_never_writes_or_starts(self):
+    def test_dry_run_create_reads_cloud_keys_and_never_writes_or_starts(self):
         record = {"id": 1, "status": "planned", "local_context_data": {"vmctl": {"source": "cloud_image"}}}
-        args = Namespace(command="sync", vm="guest", dry_run=True, purge=False)
+        args = Namespace(command="create", target="guest", dry_run=True)
         config = {"host": {"libvirt_uri": "qemu:///system"}, "netbox": {"key": "secret"}}
         with patch("vmctl.find_device", return_value=(2, 3)), \
                 patch("vmctl.get_vm", return_value=record), \
@@ -109,7 +109,7 @@ class CloudInitTests(unittest.TestCase):
                 patch("vmctl.local_spec_from_netbox", return_value=dict(self.vm)), \
                 patch("vmctl.cloud_init_from_netbox", return_value={"user-data": "data"}) as cloud, \
                 patch("vmctl.subprocess.run", return_value=SimpleNamespace(stdout="")), \
-                patch("vmctl.patch_vm") as write, patch("vmctl.create_vm") as create:
+                patch("vmctl.patch_vm") as write, patch("vmctl.create_vm", return_value=0) as create:
             self.assertEqual(vmctl.provision_command(config, args), 0)
         cloud.assert_called_once()
         write.assert_not_called()

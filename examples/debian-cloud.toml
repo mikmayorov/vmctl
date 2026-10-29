@@ -37,11 +37,15 @@
 #    кластер. В custom field sshpublickey укажите публичные ключи, по одному
 #    на строку. Комментарий будет заменён именем Contact. Можно добавить ключи
 #    в Context ВМ (пример ниже); требуется хотя бы один ключ root.
-#    У API-пользователя должен быть доступ к Contacts и их назначениям.
+#    У API-пользователя нужны view tenancy.contactassignment на назначения
+#    всех трёх уровней и view tenancy.contact на соответствующие Contacts.
+#    Отдельные view contactrole, extras.customfield и extras.configcontext
+#    для этого не нужны. Constraints и проверка токеном — в разделе README
+#    «NetBox: данные и права».
 #
 # 6. Настройте шлюзы и DNS в Context (см. ниже), затем создайте выключенную ВМ:
-#      vmctl --dry-run sync example-debian
-#      vmctl sync example-debian
+#      vmctl --dry-run create example-debian
+#      vmctl create example-debian
 #    Создаётся самостоятельный qcow2 нужного размера и постоянный NoCloud seed.
 #    virt-install --cloud-init формирует XML; исходный образ не изменяется.
 #
@@ -56,6 +60,13 @@
 #      ip route
 #      ip -6 route
 #
+# ТОЛЬКО create развёртывает cloud image и создаёт cloud-init seed.
+# prepare создаёт запись NetBox; create ИМЯ создаёт ВМ локально из этой записи.
+# sync — независимое применение изменений к уже существующей локальной ВМ:
+#      vmctl --dry-run sync example-debian
+#      vmctl sync example-debian
+# Без локальной ВМ sync завершится ошибкой, не развёртывая образ.
+#
 # Cloud-init уже установлен в generic/genericcloud. Он сам определяет Debian
 # и сетевой backend образа; пакеты Ubuntu и netplan в госте не требуются.
 # Доступ настраивается для root, а не стандартного cloud-пользователя debian.
@@ -64,6 +75,19 @@
 # существующей ВМ не обновляют ключи/сеть внутри гостя и не пересоздают seed.
 # При ошибке создания проверьте оставшиеся диск, seed и state/cloud-init/<имя>:
 # повторная команда намеренно не перезаписывает существующий cloud-диск.
+
+# УДАЛЕНИЕ (независимые операции)
+#   vmctl shutdown example-debian
+#   vmctl --dry-run delete local example-debian
+#   vmctl delete local example-debian
+# Рабочие диски станут *.qcow2.<date>.purge; запись NetBox и IP сохранятся.
+# Seed/state cloud-init удаляются, исходный cloud image остаётся.
+# Для удаления записи снимите IP с VM Interfaces в NetBox и выполните:
+#   vmctl --dry-run delete netbox example-debian
+#   vmctl delete netbox example-debian
+# Очистка ВСЕХ отложенных файлов storage.directory, независимо от ВМ:
+#   vmctl --dry-run purge
+#   vmctl purge
 
 [vm]
 # Уникальное имя NetBox/libvirt: 1–64 латинских буквы, цифры, . _ -;

@@ -41,7 +41,7 @@ man vmctl                   # полное руководство по кома�
 
 ## 2. Краткое использование без NetBox
 
-Режим действует, когда нет ключа в `config.toml`, `netbox.key` и `NETBOX_TOKEN`. `prepare`, `sync`, `adopt` и `audit` требуют NetBox.
+Режим действует, когда нет ключа в `config.toml`, `netbox.key` и `NETBOX_TOKEN`. `prepare`, `sync`, `adopt`, `audit` и `delete netbox` требуют NetBox. `delete local` и `purge` всегда работают локально, даже при настроенном NetBox.
 
 ### 2.1. Первый запуск, включая хост с существующими ВМ
 
@@ -96,7 +96,9 @@ RAM и диск в `list` показаны в десятичных GB (1 GB = 10
 
 ## 3. Краткое использование с NetBox
 
-**NetBox — источник истины** для описания ВМ и требуемого состояния. Команды изменения сначала записывают NetBox, затем меняют libvirt. Если локальный шаг не удался, запись NetBox остаётся: исправьте причину и повторите `sync`. Фоновой синхронизации нет.
+**NetBox — источник истины** для описания ВМ и требуемого состояния. `prepare` создаёт описание в NetBox; `create` читает его и развёртывает ВМ локально, после успеха отмечает `planned` как `staged`. Команды изменения параметров сначала записывают NetBox, затем меняют libvirt. Если изменение существующей ВМ не удалось, запись NetBox остаётся: исправьте причину и повторите `sync`. Если ещё не завершено первоначальное локальное создание, проверяйте и повторяйте `create`; `sync` его не заменяет. Фоновой синхронизации нет.
+
+Удаление разделено по сущностям: `delete local` удаляет локальную ВМ с отложенным удалением дисков и не обращается к NetBox; `delete netbox` удаляет только запись NetBox; `purge` очищает отложенные локальные файлы.
 
 ### 3.1. Первый запуск, включая хост с существующими ВМ
 
@@ -114,7 +116,7 @@ vmctl audit
 
 При массовых `adopt` и `sync` ошибка одной ВМ выводится с её именем, после чего обработка продолжается. В конце показано число успешных ВМ и ошибок; при любой ошибке команда возвращает ненулевой код. Если недоступен сам NetBox или не найден Device хоста, обработка не начинается.
 
-При ошибке vmctl печатает строку `Что сделать:` с конкретным следующим действием. Сначала проверьте запись ВМ и её компонентов в NetBox, локальный XML через `vmctl cat ИМЯ`, затем выполните `vmctl check ИМЯ` и пробный `vmctl --dry-run sync ИМЯ` или `vmctl --dry-run adopt ИМЯ`. Не запускайте полный `adopt` только для исправления одной настройки: он переносит в NetBox всё наблюдаемое состояние, включая дисплей.
+При ошибке vmctl печатает строку `Что сделать:` с конкретным следующим действием. Для существующей локальной ВМ проверьте запись и компоненты в NetBox, XML через `vmctl cat ИМЯ`, затем выполните `vmctl check ИМЯ` и пробный `vmctl --dry-run sync ИМЯ` или `vmctl --dry-run adopt ИМЯ`. Для новой ВМ, ещё не созданной локально, проверяйте `vmctl --dry-run create ИМЯ`; после частичной ошибки создания также проверьте оставшиеся файлы. Не запускайте полный `adopt` только для исправления одной настройки: он переносит в NetBox всё наблюдаемое состояние, включая дисплей.
 
 ### 3.2. Создание ВМ
 
@@ -124,13 +126,23 @@ cp examples/ubuntu-iso.toml local/guest.toml
 vmctl --dry-run prepare local/guest.toml
 vmctl prepare local/guest.toml
 # В NetBox назначьте IP интерфейсу, настройте display.
-vmctl --dry-run sync ИМЯ
-vmctl sync ИМЯ
+vmctl --dry-run create ИМЯ
+vmctl create ИМЯ
 vmctl start ИМЯ
 vmctl check ИМЯ
 ```
 
-`prepare` создаёт только в NetBox ВМ, Virtual Disk, интерфейс и MAC. `sync` читает NetBox и создаёт локальную ВМ. Если пауза для настройки в NetBox не нужна, `vmctl create local/guest.toml` выполняет **prepare + первый sync** подряд. `create` не запускает ВМ. TOML-запрос после создания уже не является источником параметров.
+Команды имеют отдельные задачи:
+
+| Команда | Назначение |
+| --- | --- |
+| `prepare ФАЙЛ.toml` | Создать новую запись ВМ, Virtual Disk, интерфейс и MAC **только в NetBox**. |
+| `create ИМЯ` | Прочитать подготовленную запись NetBox и **создать новую ВМ локально**: диски, XML и, для cloud image, cloud-init seed. Оставить ВМ выключенной. |
+| `sync ИМЯ` | Перенести поддерживаемые изменения из NetBox в **уже существующую локальную ВМ**. |
+
+**ТОЛЬКО `create` выполняет развёртывание cloud images.** `prepare` не создаёт локальных файлов, `create` не выполняет `prepare`, а `sync` не создаёт отсутствующую ВМ и не запускает развёртывание образа. Запуск гостя — отдельная команда `start`.
+
+После `prepare` источником параметров становится NetBox, а не TOML-запрос. В режиме NetBox `create` принимает **имя**, а не файл. Без NetBox используется `create ФАЙЛ.toml`, как в разделе 2.
 
 ### 3.3. Изменение параметров запущенной ВМ
 
@@ -159,7 +171,24 @@ vmctl sync                  # NetBox → libvirt для всех ВМ устро
 vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 ```
 
-`sync` переносит **NetBox → libvirt**, `adopt` переносит **наблюдаемое локальное состояние → NetBox** только по явному запросу, `audit` и `check` читают и сравнивают. Для работающей ВМ `check` отдельно показывает NetBox, XML следующего запуска и текущее состояние; отличия XML от памяти отмечаются `PENDING RESTART`. `audit` сообщает `MISSING NETBOX`, `MISSING LOCAL`, `DIFF` и `INVALID`. `sync` без имени продолжает обработку остальных ВМ после ошибки одной.
+`sync` переносит изменения **NetBox → существующая локальная ВМ**, `adopt` переносит **наблюдаемое локальное состояние → NetBox** только по явному запросу, `audit` и `check` читают и сравнивают. Для работающей ВМ `check` отдельно показывает NetBox, XML следующего запуска и текущее состояние; отличия XML от памяти отмечаются `PENDING RESTART`. `audit` сообщает `MISSING NETBOX`, `MISSING LOCAL`, `DIFF` и `INVALID`. Если локальной ВМ нет, `sync` сообщает об ошибке и предлагает `create ИМЯ` (для импортированной ВМ — восстановление). Массовый `sync` продолжает обработку остальных ВМ и возвращает ненулевой код при ошибках; запланированные записи автоматически не развёртываются.
+
+### 3.5. Удаление ВМ и отложенная очистка дисков
+
+```bash
+vmctl shutdown ИМЯ
+vmctl --dry-run delete local ИМЯ
+vmctl delete local ИМЯ
+# Запись NetBox, её интерфейсы и назначенные IP пока сохраняются.
+# Для удаления записи снимите IP с VM Interfaces в NetBox IPAM:
+vmctl --dry-run delete netbox ИМЯ
+vmctl delete netbox ИМЯ
+# Когда сохранённые диски больше не нужны, проверьте ВСЕ отложенные файлы:
+vmctl --dry-run purge
+vmctl purge
+```
+
+Каждая команда выполняет только свою операцию. После `delete local` ожидаемо остаётся `MISSING LOCAL` при аудите; после `delete netbox` при сохранённой локальной ВМ — `MISSING NETBOX`. Локальное удаление не требует снимать IP или иметь доступный NetBox. Команда `purge` не ограничивается последней удалённой ВМ: она очищает все подходящие отложенные файлы в текущем `storage.directory`.
 
 ## 4. Справочник команд vmctl
 
@@ -185,21 +214,50 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 
 ### Виртуальные машины
 
-#### `prepare`, `create`
+#### `prepare`
 
-`vmctl prepare local/guest.toml` создаёт ВМ и начальные компоненты только в NetBox; затем задайте IP/дисплей и выполните `vmctl sync guest`. `vmctl create local/guest.toml` в режиме NetBox выполняет `prepare` и первый `sync` подряд, в локальном режиме создаёт ВМ только в libvirt. ВМ остаётся выключенной. Файл запроса указывает `hardware = "small"` либо собственные `vcpus`, `memory_mb`, `disk_gb`; вместе их указывать нельзя. `software` пока не принимается.
+`vmctl prepare local/guest.toml` создаёт новую запланированную ВМ и начальные компоненты **только в NetBox**. Затем задайте IP, Contacts, Context и дисплей, выполните `vmctl create guest`. Для завершения подготовки после частичной ошибки можно повторить `prepare` для записи со статусом `planned`; развёрнутые записи он не переподготавливает. Файл запроса указывает `hardware = "small"` либо собственные `vcpus`, `memory_mb`, `disk_gb`; вместе их указывать нельзя. `software` пока не принимается.
+
+#### `create`
+
+С NetBox: `vmctl create guest` создаёт локальную ВМ из **существующей** записи NetBox. Сначала выполните `prepare`, затем настройте запись. `create` не создаёт запись или компоненты в NetBox; после успешного локального создания переводит `planned` в `staged`. Без NetBox: `vmctl create local/guest.toml` читает локальный TOML. В обоих режимах ВМ остаётся выключенной, даже если в NetBox указан `active`.
+
+**ТОЛЬКО через `create` выполняется развёртывание cloud image**: клонирование образа в самостоятельный диск, подготовка cloud-init seed и определение нового домена. `vmctl --dry-run create guest` проверяет данные и показывает план. Если локальная ВМ уже есть, `create` останавливается без повторного развёртывания: для изменений используйте `sync`. Утраченную импортированную (`source = "existing"`) ВМ команда не пересоздаёт.
 
 #### `sync`
 
-`vmctl sync guest` применяет запись NetBox к одной ВМ, `vmctl sync` — ко всем ВМ устройства хоста. `vmctl --dry-run sync guest` показывает план. `vmctl sync guest --purge` также удаляет управляемые файлы дисков, исключённых из NetBox, если ВМ выключена; сначала проверьте план. Изменения XML работающей ВМ ждут полного выключения и запуска.
+`vmctl sync guest` применяет изменения NetBox к одной существующей локальной ВМ, `vmctl sync` — ко всем ВМ устройства хоста. Новые ВМ, системные диски из образов и cloud-init seed **не развёртывает**; при отсутствии локальной ВМ возвращает ошибку до изменений. `vmctl --dry-run sync guest` показывает план изменений. `vmctl sync guest --purge` также удаляет управляемые файлы дисков, исключённых из NetBox, если ВМ выключена; сначала проверьте план. Дополнительные диски могут создаваться пустыми при синхронизации компонентов; это не развёртывание ОС. Изменения XML работающей ВМ ждут полного выключения и запуска. Питание по статусам `active`/`offline` синхронизируется как прежде.
 
 #### `adopt`
 
 `vmctl adopt guest` переносит фактические параметры одной локальной ВМ в NetBox, `vmctl adopt` — всех. `vmctl --dry-run adopt` показывает план. Полный `adopt` обновляет также дисплей и остальные наблюдаемые параметры ВМ. Он заполняет `vmctl.interfaces` и переводит старую запись Context на новую схему, сохраняя имена VM Interfaces и их IP. Если нужно **только** перевести сетевое описание на новую схему и сохранить дисплей, ресурсы и прочие поля NetBox, выполните `vmctl --dry-run adopt --interfaces-only`, затем `vmctl adopt --interfaces-only` (можно указать одну ВМ). Этот режим также заполняет пустой Description VM Interface данными о TAP и мосте; написанное вручную описание сохраняет. Libvirt и IPAM команды не меняют. Device хоста и кластер должны уже существовать.
 
-#### `delete`
+#### `delete local`
 
-`vmctl delete guest` удаляет выключенную ВМ из libvirt и NetBox, сохраняя файлы. `vmctl --dry-run delete guest --purge` показывает план с удалением управляемых файлов; `vmctl delete guest --purge` его выполняет. IP предварительно снимите с интерфейсов в NetBox. Запись ВМ удаляйте командой `vmctl delete`, чтобы действие можно было повторить после ошибки.
+`vmctl delete local guest` удаляет определение **выключенной локальной ВМ** из libvirt и переименовывает её рабочие диски в `storage.directory`, сохраняя их содержимое:
+
+```text
+guest.qcow2      → guest.qcow2.20261029T143012123456Z.purge
+guest-data.qcow2 → guest-data.qcow2.20261029T143012123456Z.purge
+```
+
+Формат `<date>` — `YYYYMMDDTHHMMSSffffffZ`: UTC, включая микросекунды. Все диски одной операции получают одну метку времени. Диски из незавершённого удаления компонентов (`state/pending-purge/`) также переводятся в отложенные файлы. Запись NetBox, её статус, интерфейсы, IP и Contacts не меняются; API NetBox не используется.
+
+UEFI NVRAM удаляется при снятии определения. Сгенерированные vmctl cloud-init seed и каталог `state/cloud-init/guest/`, сохранённый XML и локальное состояние операции очищаются. Исходный cloud image и установочный ISO не удаляются. Поддерживаются обычные файлы дисков непосредственно в `storage.directory`; диски другого типа/каталога и файлы, подключённые другой ВМ, блокируют операцию до снятия определения.
+
+План: `vmctl --dry-run delete local guest`. Если операция прервалась после снятия определения или переименования части дисков, повторите **ту же** `delete local guest`: продолжение хранится в `state/local-delete/guest.json`, а уже переименованные файлы повторно не переименовываются. До завершения этого удаления `create` с тем же именем и очистка его отложенных дисков блокируются. После успешного удаления можно явно выполнить новый `create guest` из сохранённой записи NetBox; старые диски остаются отдельно до `purge`.
+
+#### `delete netbox`
+
+`vmctl delete netbox guest` удаляет **только запись ВМ в NetBox** и зависимые компоненты по правилам NetBox. Нужен API-ключ и права на эту ВМ; сначала снимите IP со всех VM Interfaces. Сами IP-объекты, Contacts и исходные образы не удаляются. Команда не обращается к libvirt, не выключает и не удаляет локальную ВМ, не переименовывает диски и не выполняет `delete local`. План: `vmctl --dry-run delete netbox guest`.
+
+#### `purge`
+
+`vmctl --dry-run purge` показывает список, `vmctl purge` окончательно удаляет **все** обычные файлы вида `*.<date>.purge` с корректной датой указанного выше формата непосредственно в `storage.directory`. Возраст файлов не учитывается. NetBox не используется. Обычные рабочие диски, файлы с произвольным суффиксом `.purge`, символические ссылки и файлы вне каталога не удаляются.
+
+Перед очисткой проверяются постоянные и текущие XML всех локальных ВМ. Если отложенный файл подключён к ВМ или относится к незавершённому `delete local`, команда останавливается до удаления файлов. Для этой проверки нужен доступный libvirt. После частичной ошибки файловой очистки можно повторить `purge`.
+
+Прежние формы `delete ИМЯ` и `delete ИМЯ --purge` больше не принимаются: сущность нужно выбрать явно. Параметр `--purge` у `disk remove`/`sync` относится к удалению компонентов и сохраняет прежнее поведение; он не заменяет отдельную команду `purge` для отложенных файлов ВМ.
 
 ### Диски и интерфейсы
 
@@ -238,6 +296,8 @@ vmctl --dry-run adopt ИМЯ   # обратный импорт одной ВМ
 | Интерфейсы и MAC | `VM Interfaces` и Primary MAC | Имя VM Interface обозначает гостевой NIC; для новой ВМ по умолчанию `eth0`. Primary MAC — адрес **гостевого** адаптера. Имя хостового TAP и мост хранятся отдельно в Context. `sync` применяет значения к постоянному XML; работающей ВМ нужен следующий запуск. |
 | IPv4/IPv6 | IPAM: адрес на интерфейсе, затем Primary IP ВМ при необходимости | Адрес назначает администратор вручную. При создании Cloud Image все адреса интерфейсов передаются cloud-init; для существующего гостя сеть автоматически не меняется. |
 | Мост, источник установки, пути, дисплей | `local_context_data.vmctl` ВМ | `sync` строит постоянную конфигурацию. Для нового запроса значения по умолчанию берутся из `config.toml`. |
+| Шлюзы, DNS и search domains для первого запуска | `vmctl.cloud_init` в Context ВМ/хоста и общем Config Context кластера | Читаются при создании cloud image. Итоговый `config_context` приходит в ответе API ВМ/Device. |
+| SSH-ключи root для первого запуска | Contacts с ролью `coreroot`, custom field `sshpublickey`; дополнительные ключи в Context ВМ | Читаются назначения Contacts на ВМ, Device и кластере, затем полные записи контактов. |
 
 У одного подключения два MAC-адреса:
 
@@ -254,7 +314,7 @@ libvirt задаёт TAP другой первый байт (`fe` вместо `
 
 Отдельные Device Interfaces для TAP создавать не требуется. Поле NetBox **Related Interfaces / Bridged Interface** связывает только интерфейсы внутри одной ВМ, поэтому оно не может ссылаться на мост Device хоста. [Модель VM Interface](https://netboxlabs.com/docs/netbox/v4.5/models/virtualization/vminterface/).
 
-Статусы: `planned` — запись до создания на хосте; `staged` — ВМ определена, запуск не запрошен; `active` — должна работать; `offline` — должна быть выключена. `sync` применяет питание для `active`/`offline`. Если NetBox недоступен, управляемая операция останавливается до локального изменения. Если ошибка случилась после записи NetBox, проверьте `audit` и повторите `sync`.
+Статусы: `planned` — запись до создания на хосте; `staged` — ВМ определена, запуск не запрошен; `active` — должна работать; `offline` — должна быть выключена. `create` всегда оставляет новую ВМ выключенной. `sync` применяет питание для `active`/`offline` только у существующей локальной ВМ. Если NetBox недоступен, управляемая операция останавливается до локального изменения. После ошибки изменения существующей ВМ проверьте `audit` и повторите `sync`; после ошибки первоначального создания проверяйте `create` и оставшиеся файлы.
 
 ### Групповые права API-пользователей
 
@@ -270,7 +330,90 @@ libvirt задаёт TAP другой первый байт (`fe` вместо `
 | `dcim.macaddress` | view, add, change, delete | `{"vminterface__virtual_machine__device__owner__users":"$user"}` |
 | `ipam.ipaddress` | view | `{"vminterface__virtual_machine__device__owner__users":"$user"}` |
 
+Для создания из cloud image добавьте **два отдельных правила** чтения:
+
+| Object Types | Действия | Constraints |
+| --- | --- | --- |
+| `tenancy.contactassignment` | view | `{"role__slug":"coreroot"}` |
+| `tenancy.contact` | view | `{"assignments__role__slug":"coreroot"}` |
+
+Это общие правила группы: они разрешают читать назначения с ролью `coreroot` и полные записи участвующих в них контактов, **в том числе назначенных другим хостам**. Ограничения Owner в основной таблице продолжают действовать на операции с ВМ, но не ограничивают эти два правила. Полная запись Contact включает не только публичный ключ, но и остальные поля контакта. vmctl запрашивает назначения только для выбранной ВМ, её Device и кластера; это фильтрация клиента, а не граница прав токена.
+
+Если контакты должны быть изолированы между хостами, вместо этих двух групповых правил назначьте отдельному пользователю хоста `view` на конкретные записи: для `tenancy.contactassignment` — `{"pk__in":[101,102,103]}`, для `tenancy.contact` — `{"pk__in":[11,12]}`. Замените числа ID нужных назначений и контактов всех трёх уровней; обновляйте список при добавлении назначений. Общее групповое правило при этом должно отсутствовать: разрешения NetBox складываются. У `ContactAssignment.object` полиморфная связь (`object_type` + `object_id`), поэтому ограничение вроде `object__device__owner__users` здесь не работает; в отличие от VM Interface, прямого пути к Device у назначения нет.
+
 Адресами управляет IPAM-администратор. Проверьте, что пользователь не получает широкие права через другую группу или прямое разрешение: NetBox объединяет подходящие правила. Owner должен содержать конкретного пользователя хоста, а не всю группу. После настройки проверьте `vmctl check`, создание/удаление компонентов тестовой ВМ и отсутствие доступа токена к ВМ другого хоста.
+
+### Какие дополнительные данные читает cloud-init
+
+Список ниже соответствует запросам текущего vmctl. Дополнительные данные для cloud-init читаются **только через `create`** при локальном развёртывании cloud-ВМ, в том числе при `--dry-run create`. `sync` существующей ВМ не собирает ключи Contacts и не генерирует seed.
+
+| Данные | Запрос относительно `/api/` | Необходимое право |
+| --- | --- | --- |
+| Context ВМ, включая общие настройки кластера | `GET virtualization/virtual-machines/<vm_id>/` | `view` нужной `virtualization.virtualmachine`, уже есть в основной таблице |
+| Context гипервизора | `GET dcim/devices/<device_id>/` | `view` своего `dcim.device`, уже есть в основной таблице |
+| IP с префиксами каждого гостевого NIC | `GET ipam/ip-addresses/?assigned_object_type=virtualization.vminterface&assigned_object_id=<interface_id>` | `view` адресов этой ВМ, уже есть в основной таблице |
+| Назначения Contacts ВМ | `GET tenancy/contact-assignments/?object_type=virtualization.virtualmachine&object_id=<vm_id>` | `view` соответствующих `tenancy.contactassignment` |
+| Назначения Contacts хоста | `GET tenancy/contact-assignments/?object_type=dcim.device&object_id=<device_id>` | То же, включая назначения на Device |
+| Назначения Contacts кластера | `GET tenancy/contact-assignments/?object_type=virtualization.cluster&object_id=<cluster_id>` | То же, включая назначения на Cluster |
+| Имя Contact и `custom_fields.sshpublickey` | `GET tenancy/contacts/<contact_id>/` | `view` каждого используемого `tenancy.contact` |
+
+Отдельные разрешения `view` на `tenancy.contactrole`, `tenancy.contactgroup`, `extras.customfield`, `extras.configcontext` и `virtualization.cluster` **для этих запросов не нужны**. Роль со slug приходит вложенной в ContactAssignment, значение custom field — в Contact, а итоговый Context — в ВМ/Device. vmctl не обращается к API справочников ролей/групп, определениям custom fields, списку Config Context или detail кластера. Право создавать/редактировать эти объекты API-пользователю vmctl также не требуется: данные заранее готовит администратор. Для настройки их через UI администратору нужны собственные соответствующие права.
+
+При подготовке данных проверьте: Contact Role имеет **slug** `coreroot`; custom field с техническим именем **`sshpublickey`** назначен модели Contact и содержит публичный ключ. Общий Config Context должен быть активен и назначен нужному кластеру; vmctl читает уже объединённый `config_context`, а не вычисляет назначения контекстов самостоятельно.
+
+Схема сверена с моделями и сериализаторами NetBox 4.5: [Contact и ContactAssignment](https://github.com/netbox-community/netbox/blob/v4.5.0/netbox/tenancy/models/contacts.py), [вложенные Contact/Role в API](https://github.com/netbox-community/netbox/blob/v4.5.0/netbox/tenancy/api/serializers_/contacts.py), [сборка Config Context](https://github.com/netbox-community/netbox/blob/v4.5.0/netbox/extras/models/configs.py). Для установленного NetBox окончательная проверка выполняется под токеном хоста.
+
+### Проверка чтения под токеном хоста
+
+`vmctl check` проверяет доступ к Device и списку ВМ, но не проверяет назначения Contacts и их ключи. Для подготовленной cloud-ВМ, которой ещё нет в libvirt, выполните:
+
+```bash
+vmctl --dry-run create ИМЯ
+```
+
+Для отдельной проверки API, в том числе уже существующей ВМ, запустите из `/opt/vmctl` следующий пример. Он использует те же `config.toml`, `netbox.key`/`NETBOX_TOKEN`, что и vmctl, не меняет NetBox/libvirt и не печатает ключи или содержимое Context. Замените `ИМЯ` именем ВМ. Если используется другой файл конфигурации, замените `DEFAULT_CONFIG` в вызове `load_config` на `Path("/путь/config.toml")` и импортируйте `Path` из `pathlib`.
+
+```bash
+python3 - ИМЯ <<'PY'
+import sys
+import urllib.parse
+from vmctl import DEFAULT_CONFIG, load_config
+from netbox import (
+    _list_results, _request, find_device, get_vm, root_ssh_authorized_keys,
+)
+
+config = load_config(DEFAULT_CONFIG)
+device_id, cluster_id = find_device(config)
+vm = get_vm(config, sys.argv[1], cluster_id, device_id)
+host = _request(config, "GET", f"dcim/devices/{device_id}/")
+for label, record in (("VM", vm), ("Device", host)):
+    fields = [name for name in ("config_context", "local_context_data") if name in record]
+    print(f"{label}: доступны поля {', '.join(fields) or 'Context отсутствует'}")
+
+for object_type, object_id in (
+    ("virtualization.virtualmachine", vm["id"]),
+    ("dcim.device", device_id),
+    ("virtualization.cluster", cluster_id),
+):
+    query = urllib.parse.urlencode({"object_type": object_type, "object_id": object_id})
+    assignments = _list_results(config, f"tenancy/contact-assignments/?{query}")
+    contacts = [item["contact"] for item in assignments
+                if (item.get("role") or {}).get("slug") == "coreroot"]
+    print(f"{object_type} #{object_id}: видно назначений coreroot: {len(contacts)}")
+    for item in contacts:
+        contact = _request(config, "GET", f"tenancy/contacts/{item['id']}/")
+        value = (contact.get("custom_fields") or {}).get("sshpublickey")
+        status = "заполнен" if value else "пуст или отсутствует"
+        print(f"  Contact #{contact['id']} {contact['name']}: sshpublickey {status}")
+
+keys = root_ssh_authorized_keys(config, vm)
+print(f"Всего уникальных ключей root с учётом Context: {len(keys)}")
+if not keys:
+    raise SystemExit("Нет ключей root: проверьте назначения, права и Context ВМ")
+PY
+```
+
+Сверьте количество и имена видимых контактов на **каждом из трёх уровней** со списком, который видит администратор. При ограничении объектов NetBox может вернуть `200` с пустым или неполным списком назначений/IP, а не `403`. Успешное чтение одного Contact или наличие ключа из Context не доказывает, что видны все ожидаемые `coreroot`. `403` означает недостаточное право на endpoint; `404` при чтении известного Contact может означать, что объект скрыт ограничениями. После исправления прав повторите пробный `create` новой ВМ. Для уже созданной ВМ используйте отдельную проверку API выше: `create` её не пересоздаст, а `sync` не обновит гостевой `authorized_keys` автоматически.
 
 ## 6. Как устроена виртуализация в Linux
 
@@ -303,7 +446,9 @@ qemu-system-x86_64 -enable-kvm -m 2048 -smp 2 \
 
 ## 7. Cloud Images и cloud-init
 
-Для **Ubuntu, Debian и Arch Linux** используется единый режим `source = "cloud_image"`. Дистрибутив выбирается самим образом в поле `image`; отдельный параметр ОС не нужен. Cloud-init использует настройки дистрибутива и сетевого backend из образа. vmctl не задаёт `system_info.distro`, не устанавливает пакеты Ubuntu в другие ОС и передаёт общий сетевой формат cloud-init v2 (статические адреса, MAC, маршруты и DNS), который cloud-init преобразует в конфигурацию доступного backend.
+Для **Ubuntu, Debian и Arch Linux** используется единый режим `source = "cloud_image"`. **Развёртывание cloud images выполняется ТОЛЬКО командой `create`**, после создания записи через `prepare` и настройки NetBox. `sync` служит независимой синхронизацией изменений уже существующей локальной ВМ и не заменяет `create`.
+
+Дистрибутив выбирается самим образом в поле `image`; отдельный параметр ОС не нужен. Cloud-init использует настройки дистрибутива и сетевого backend из образа. vmctl не задаёт `system_info.distro`, не устанавливает пакеты Ubuntu в другие ОС и передаёт общий сетевой формат cloud-init v2 (статические адреса, MAC, маршруты и DNS), который cloud-init преобразует в конфигурацию доступного backend.
 
 Исходный образ хранится, например, в `/var/lib/libvirt/images-ro`. vmctl создаёт самостоятельный qcow2 через `qemu-img convert`, увеличивает его до размера из `hardware` и подключает NoCloud seed. Исходный образ остаётся шаблоном. Выбор по `vm.software` пока недоступен: укажите полный путь `image`.
 
@@ -323,8 +468,8 @@ cp examples/ubuntu-cloud.toml local/guest.toml
 vmctl prepare local/guest.toml
 # В NetBox назначьте статические IPv4/IPv6 с префиксами всем VM Interfaces.
 # Назначьте Contacts coreroot и при необходимости дополните Context.
-vmctl --dry-run sync example-ubuntu
-vmctl sync example-ubuntu
+vmctl --dry-run create example-ubuntu
+vmctl create example-ubuntu
 vmctl start example-ubuntu
 ```
 
@@ -362,4 +507,4 @@ Cloud-init в перечисленных образах уже установл�
 
 Дополнительные ключи задаются списком `vmctl.cloud_init.root_ssh_authorized_keys` в Context ВМ. Они сохраняются без изменения. Одинаковые ключи сравниваются по типу и ключевым данным; вариант из Context имеет приоритет над вариантом из Contacts. Сборщик также читает итоговый `config_context`, включая общие Config Context, назначенные кластеру; локальное значение списка ВМ имеет приоритет.
 
-Для этого API-пользователю нужны права чтения `tenancy.contactassignment`, `tenancy.contact` и `tenancy.contactrole` с доступом к соответствующим назначениям и контактам.
+Для этого API-пользователю нужны права чтения `tenancy.contactassignment` и `tenancy.contact` с доступом к соответствующим назначениям всех трёх уровней и контактам. Отдельное право `tenancy.contactrole` не требуется. Точные Constraints и проверка токеном хоста приведены в [разделе 5](#групповые-права-api-пользователей).

@@ -1,3 +1,12 @@
+# С NetBox: vmctl prepare local/guest.toml -> настройка записи NetBox ->
+# vmctl create example-ubuntu -> vmctl start example-ubuntu.
+# Без NetBox: vmctl create local/guest.toml -> vmctl start example-ubuntu.
+# prepare создаёт только запись NetBox; create — локальную выключенную ВМ.
+# sync применяет изменения к существующей локальной ВМ, но не создаёт новую.
+# Удаление: delete local example-ubuntu отложит рабочие диски в *.<date>.purge;
+# delete netbox example-ubuntu отдельно удалит запись NetBox (сначала снимите IP).
+# vmctl --dry-run purge покажет ВСЕ отложенные диски хранилища; vmctl purge удалит их.
+
 [vm]
 name = "example-ubuntu"
 description = "Example Ubuntu VM"

@@ -302,33 +302,29 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual([call[1] for call in calls], ["PATCH"])
         self.assertEqual(calls[0][3]["primary_mac_address"], 19)
 
-    def test_delete_marks_netbox_before_undefine_then_deletes_record(self):
-        order = []
-        args = Namespace(command="delete", vm="guest", purge=False, dry_run=False)
+    def test_delete_local_never_reads_or_writes_netbox(self):
+        args = Namespace(command="delete", action="local", vm="guest", dry_run=False)
         config = {"netbox": {"key": "secret"}, "host": {"libvirt_uri": "qemu:///system"},
                   "storage": {"directory": "/images"}}
-        with (patch("vmctl._stopped", return_value=True),
-              patch("vmctl.find_device", return_value=(1, 2)),
-              patch("vmctl.get_vm", return_value={"id": 7, "name": "guest"}),
-              patch("vmctl.vm_interfaces", return_value=[]),
-              patch("vmctl.inspect_vm", return_value={"disk_paths": ["/images/guest.qcow2"]}),
-              patch("vmctl.patch_vm", side_effect=lambda *a: order.append("mark")),
-              patch("vmctl.subprocess.run", side_effect=lambda *a, **k: order.append("undefine")),
-              patch("vmctl._request", side_effect=lambda *a: order.append("delete")),
+        with (patch("vmctl.delete_local_vm", return_value=0) as local,
+              patch("vmctl.find_device") as lookup,
+              patch("vmctl.patch_vm") as update,
+              patch("vmctl._request") as request,
               contextlib.redirect_stdout(io.StringIO())):
             self.assertEqual(vmctl.delete_vm(config, args), 0)
-        self.assertEqual(order, ["mark", "undefine", "delete"])
+        local.assert_called_once()
+        lookup.assert_not_called()
+        update.assert_not_called()
+        request.assert_not_called()
 
-    def test_delete_does_not_undefine_when_netbox_mark_fails(self):
-        args = Namespace(command="delete", vm="guest", purge=False, dry_run=False)
+    def test_delete_netbox_does_not_access_libvirt_even_when_api_delete_fails(self):
+        args = Namespace(command="delete", action="netbox", vm="guest", dry_run=False)
         config = {"netbox": {"key": "secret"}, "host": {"libvirt_uri": "qemu:///system"},
                   "storage": {"directory": "/images"}}
-        with (patch("vmctl._stopped", return_value=True),
-              patch("vmctl.find_device", return_value=(1, 2)),
+        with (patch("vmctl.find_device", return_value=(1, 2)),
               patch("vmctl.get_vm", return_value={"id": 7, "name": "guest"}),
               patch("vmctl.vm_interfaces", return_value=[]),
-              patch("vmctl.inspect_vm", return_value={"disk_paths": ["/images/guest.qcow2"]}),
-              patch("vmctl.patch_vm", side_effect=netbox.NetBoxError("403")),
+              patch("vmctl._request", side_effect=netbox.NetBoxError("403")),
               patch("vmctl.subprocess.run") as local):
             with self.assertRaises(netbox.NetBoxError):
                 vmctl.delete_vm(config, args)

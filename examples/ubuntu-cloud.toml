@@ -36,11 +36,15 @@
 #      по примеру в конце этого файла. Нужен хотя бы один ключ root.
 #    - Проверьте мост и имя TAP в существующем vmctl.interfaces, при желании
 #      настройте vmctl.display. Сохраняйте остальные поля Context от prepare.
-#    API-пользователю vmctl нужен доступ на чтение Contacts и их назначений.
+#    API-пользователю нужны view tenancy.contactassignment на назначения всех
+#    трёх уровней и view tenancy.contact на соответствующие Contacts.
+#    Роль и sshpublickey приходят вложенными; отдельные view contactrole,
+#    extras.customfield и extras.configcontext для этого не требуются.
+#    Constraints и проверка токеном: README.md, «NetBox: данные и права».
 #
 # 5. Проверьте план и создайте выключенную ВМ на хосте:
-#      vmctl --dry-run sync example-ubuntu
-#      vmctl sync example-ubuntu
+#      vmctl --dry-run create example-ubuntu
+#      vmctl create example-ubuntu
 #    vmctl создаст самостоятельный qcow2 из image, увеличит его до размера
 #    из hardware и подключит постоянный NoCloud seed с настройками из NetBox.
 #    Исходный образ не изменяется. virt-install --cloud-init формирует XML
@@ -59,12 +63,31 @@
 #      ip -6 route
 #
 # ВАЖНО О ПЕРВОМ ЗАПУСКЕ
+# ТОЛЬКО create выполняет развёртывание cloud image и создаёт cloud-init seed.
+# prepare создаёт запись в NetBox; create ИМЯ создаёт ВМ локально из записи.
+# sync переносит изменения только в уже существующую локальную ВМ:
+#      vmctl --dry-run sync example-ubuntu
+#      vmctl sync example-ubuntu
+# Если ВМ ещё нет локально, sync вернёт ошибку, не развёртывая образ.
 # Cloud-init задаёт hostname, ключи root и статическую сеть, отключает вход
 # по SSH-паролю и расширяет корневую файловую систему. Последующие sync
 # существующей ВМ не пересоздают seed и не обновляют ключи/сеть внутри гостя.
 # После prepare источником параметров становится NetBox, а не этот TOML.
 # Если создание прервалось после записи диска, проверьте оставшиеся файлы:
 # vmctl намеренно не перезаписывает существующий диск cloud image при повторе.
+#
+# УДАЛЕНИЕ (две независимые сущности)
+#   vmctl shutdown example-ubuntu
+#   vmctl --dry-run delete local example-ubuntu
+#   vmctl delete local example-ubuntu
+# Рабочие диски станут *.qcow2.<date>.purge; запись NetBox и IP сохранятся.
+# Сгенерированный cloud-init seed и состояние удаляются, исходный образ остаётся.
+# Для удаления записи сначала снимите IP с VM Interfaces в NetBox, затем:
+#   vmctl --dry-run delete netbox example-ubuntu
+#   vmctl delete netbox example-ubuntu
+# Окончательная очистка ВСЕХ отложенных файлов в storage.directory:
+#   vmctl --dry-run purge
+#   vmctl purge
 #
 # ПОЛЯ ЗАПРОСА
 

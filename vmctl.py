@@ -13,7 +13,6 @@ import time
 import tomllib
 import uuid
 import textwrap
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from netbox import (
@@ -26,6 +25,7 @@ from inventory import inspect_definition, inspect_display, inspect_vm, local_nam
 from cloudinit import cloud_init_from_netbox
 from vmcreate import (NAME_RE, create_vm, host_interface_name, interface_alias, pending_purge_file, purge_pending,
                       redefine_vm, validate_spec, verify_local_vm)
+from vmdelete import delete_local_vm, purge_local_disks
 
 
 DEFAULT_CONFIG = Path(__file__).with_name("config.toml")
@@ -37,6 +37,15 @@ def error_hint(error: Exception, command: str, name: str | None = None) -> str:
     """Give the operator one concrete next check without changing either system."""
     detail = str(error).lower()
     target = name or "ИМЯ"
+    if command == "purge":
+        return "Проверьте vmctl --dry-run purge; завершите незаконченные delete local и отключите используемые .purge файлы."
+    if command == "delete":
+        return (f"Проверьте план vmctl --dry-run delete local {target} или vmctl --dry-run delete netbox {target}. "
+                "Локальная ВМ должна быть выключена; для удаления записи NetBox сначала снимите IP с её интерфейсов.")
+    if "sync never deploys images" in detail:
+        return f"Для новой ВМ выполните vmctl --dry-run create {target}, затем vmctl create {target}."
+    if command == "create" and "does not exist in netbox" in detail:
+        return "Сначала выполните vmctl prepare ФАЙЛ.toml, настройте запись в NetBox и повторите create ИМЯ."
     if "cloud-init" in detail or "cloud_init" in detail or "gateway" in detail:
         return ("Проверьте IP на всех VM Interfaces, Contacts с ролью coreroot и полем sshpublickey, "
                 "а также vmctl.cloud_init в Context ВМ/хоста/кластера. Для cloud image нужны virt-install, xorriso и UEFI (OVMF).")
@@ -206,7 +215,8 @@ def _overview(groups: list[tuple[str, list[tuple[str, str]]]],
         lines.append("")
     lines.extend((
         "Подробности: vmctl КОМАНДА -h (например, vmctl disk add -h).",
-        "При наличии ключа изменения сначала записываются в NetBox.",
+        "prepare: NetBox; create: локальное развёртывание; sync: изменения.",
+        "delete local и purge не обращаются к NetBox.",
     ))
     return "\n".join(lines)
 
@@ -247,17 +257,17 @@ def build_parser() -> argparse.ArgumentParser:
     cat_cmd.add_argument("vm", metavar="ИМЯ", help="Имя локальной ВМ")
     cat_cmd.add_argument("--live", action="store_true", help="Показать текущий XML работающей ВМ вместо постоянного")
 
-    prepare = add("prepare", "Подготовить ВМ из ISO: создать запись, диск, интерфейс и MAC только в NetBox. Локальная ВМ появится после sync; нужен API-ключ.",
+    prepare = add("prepare", "Создать новую ВМ и начальные компоненты только в NetBox. Нужен API-ключ; локальное развёртывание выполняется отдельно через create.",
                   "vmctl prepare local/guest.toml",
-                  details="После prepare можно назначить IP в NetBox IPAM, настроить дисплей и изменить параметры ВМ. Затем выполните vmctl sync ИМЯ.")
+                  details="После prepare назначьте IP, Contacts и настройки Context в NetBox. Затем выполните vmctl create ИМЯ.")
     prepare.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
-    create = add("create", "Создать ВМ из ISO. При наличии ключа выполнить prepare и первый sync за один вызов: сначала запись и компоненты в NetBox, затем локальная ВМ из этой записи. Между этапами нет паузы для правок в NetBox. Без ключа создаёт ВМ только локально; ВМ не запускает.",
-                 "vmctl create local/guest.toml",
-                 details="Если нужно назначить IP или изменить дисплей до создания локальной ВМ, используйте prepare, затем правки в NetBox и sync.")
-    create.add_argument("spec", type=Path, metavar="ФАЙЛ", help="TOML-файл с первоначальными параметрами ВМ")
-    sync = add("sync", "Применить записи NetBox к одной или всем ВМ этого хоста. XML работающей ВМ вступит в силу после выключения и запуска.",
+    create = add("create", "Создать новую ВМ локально из ISO или cloud image, оставив выключенной. В режиме NetBox принимает имя подготовленной ВМ; без NetBox — TOML-файл. prepare не выполняет.",
+                 "vmctl create guest",
+                 details="С NetBox: prepare ФАЙЛ → настройка записи → create ИМЯ → start ИМЯ. Без NetBox: create ФАЙЛ.toml. ТОЛЬКО create развёртывает cloud images и создаёт cloud-init seed; sync этого не делает.")
+    create.add_argument("target", metavar="ИМЯ_ИЛИ_ФАЙЛ", help="Имя существующей записи NetBox; без API-ключа — TOML-файл")
+    sync = add("sync", "Перенести изменения из NetBox в уже существующие локальные ВМ. Новые ВМ не создаёт. XML работающей ВМ вступит в силу после выключения и запуска.",
                "vmctl --dry-run sync",
-               details="Без имени обработать все ВМ устройства этого хоста; с именем — одну. Ошибка одной ВМ не останавливает остальные. IP в гостевой ОС команда не настраивает.")
+               details="Без имени обработать все ВМ устройства этого хоста; с именем — одну. Отсутствующая локальная ВМ даёт ошибку; для развёртывания используйте create. Ошибка одной ВМ не останавливает остальные. Cloud-init и сеть внутри гостя не запускает.")
     sync.add_argument("vm", nargs="?", metavar="ИМЯ", help="Одна ВМ; без имени все ВМ устройства хоста в NetBox")
     sync.add_argument("--purge", action="store_true",
                       help="Удалить файлы управляемых дисков, уже исключённых из NetBox (без имени — у всех ВМ)")
@@ -301,12 +311,20 @@ def build_parser() -> argparse.ArgumentParser:
     nic_remove.add_argument("vm", metavar="ВМ", help="Имя выключенной ВМ")
     nic_remove.add_argument("name", metavar="ИНТЕРФЕЙС", help="Короткое имя или имя TAP существующего интерфейса")
 
-    delete = add("delete", "Удалить выключенную ВМ из libvirt и, при наличии ключа, из NetBox. IP с интерфейсов нужно снять заранее; файлы дисков по умолчанию остаются.",
-                 "vmctl --dry-run delete guest --purge",
-                 details="Проверьте план через --dry-run. После частичной ошибки повторите delete с тем же выбором --purge.")
-    delete.add_argument("vm", metavar="ИМЯ", help="Имя выключенной ВМ")
-    delete.add_argument("--purge", action="store_true",
-                        help="Удалить также управляемые файлы дисков; без флага сохранить их")
+    delete = add("delete", "Удалить отдельно локальную ВМ или запись NetBox: выберите local либо netbox.",
+                 "vmctl --dry-run delete local guest",
+                 details="delete local снимает определение ВМ и переименовывает диски в *.<date>.purge. delete netbox удаляет только запись NetBox. Отложенные файлы удаляются отдельной командой purge.")
+    delete_actions = delete.add_subparsers(dest="action", required=True, title="Сущность", metavar="{local,netbox}")
+    local_delete = add("local", "Удалить выключенную ВМ из libvirt; диски переименовать в *.<date>.purge. NetBox и его IP не меняются.",
+                       "vmctl --dry-run delete local guest", delete_actions,
+                       details="Рабочие диски в storage.directory сохраняются под датированными именами до vmctl purge. Сгенерированный seed и состояние cloud-init удаляются. После частичной ошибки повторите delete local ИМЯ.")
+    local_delete.add_argument("vm", metavar="ИМЯ", help="Имя выключенной локальной ВМ")
+    netbox_delete = add("netbox", "Удалить только запись ВМ и её компоненты в NetBox. Сначала снимите назначенные интерфейсам IP. Libvirt и файлы не затрагиваются.",
+                        "vmctl --dry-run delete netbox guest", delete_actions)
+    netbox_delete.add_argument("vm", metavar="ИМЯ", help="Имя ВМ в NetBox на Device этого хоста")
+    add("purge", "Окончательно удалить датированные *.<date>.purge файлы из storage.directory. NetBox не используется.",
+        "vmctl --dry-run purge",
+        details="Сначала проверьте список через --dry-run. Обычные диски, ISO и исходные cloud images не удаляются. Файлы, подключённые к ВМ или относящиеся к незавершённому delete local, блокируют очистку.")
 
     for name, description in (
         ("start", "Запросить запуск ВМ; при наличии ключа сначала установить статус active в NetBox."),
@@ -328,11 +346,13 @@ def build_parser() -> argparse.ArgumentParser:
             ("audit", "Сверить ВМ с NetBox"),
         ]),
         ("Виртуальные машины", [
-            ("prepare", "Только NetBox; затем правки и sync"),
-            ("create", "prepare + sync сразу, без паузы для правок"),
-            ("sync", "Одна или все ВМ по NetBox; --purge: файлы"),
+            ("prepare", "Создать новую запись ВМ только в NetBox"),
+            ("create", "Создать ВМ локально; cloud images только здесь"),
+            ("sync", "Применить изменения к существующим локальным ВМ"),
             ("adopt", "Передать в NetBox одну или все локальные ВМ"),
-            ("delete", "Удалить ВМ; --purge удалит и диски"),
+            ("delete local", "Удалить локальную ВМ; диски отложить в .purge"),
+            ("delete netbox", "Удалить только запись и компоненты NetBox"),
+            ("purge", "Окончательно удалить отложенные .purge диски"),
         ]),
         ("Компоненты", [
             ("disk add", "Добавить диск"),
@@ -394,7 +414,7 @@ def verify_vm_serial(config: dict, record: dict, local_exists: bool) -> str:
     """Require NetBox UUID and reject a conflicting local VM."""
     saved = vm_serial_uuid(record)
     if not saved:
-        raise NetBoxError(f"VM {record['name']}: NetBox Serial is empty; set it to the libvirt UUID in NetBox before sync")
+        raise NetBoxError(f"VM {record['name']}: NetBox Serial is empty; check the prepared UUID or set it to the existing libvirt UUID")
     actual = local_uuid(config, record["name"]) if local_exists else None
     if actual and saved != actual:
         raise NetBoxError(f"VM {record['name']}: NetBox Serial {saved} differs from libvirt UUID {actual}")
@@ -679,55 +699,21 @@ def delete_vm(config: dict, args: argparse.Namespace) -> int:
     name = args.vm
     if not NAME_RE.fullmatch(name):
         raise ValueError("invalid VM name")
-    exists = _stopped(config, name)
-    managed = has_netbox_key(config)
-    record = None
-    if managed:
-        device_id, cluster_id = find_device(config)
-        record = get_vm(config, name, cluster_id, device_id)
-        for interface in vm_interfaces(config, record["id"]):
-            if interface_ips(config, interface["id"]):
-                raise NetBoxError("unassign VM interface IP addresses in NetBox IPAM before deleting the VM")
-    elif not exists:
-        raise ValueError(f"local VM {name!r} does not exist")
-    previous = ((record or {}).get("local_context_data") or {}).get("vmctl", {}).get("delete_requested")
-    paths = inspect_vm(config, name)["disk_paths"] if exists else (previous or {}).get("disk_paths", [])
-    if args.purge:
-        _purgeable(config, name, paths)
+    if args.action == "local":
+        return delete_local_vm(config, name, Path(__file__).parent, args.dry_run)
+    if args.action != "netbox":
+        raise ValueError("delete requires local or netbox")
+    require_netbox(config)
+    device_id, cluster_id = find_device(config)
+    record = get_vm(config, name, cluster_id, device_id)
+    for interface in vm_interfaces(config, record["id"]):
+        if interface_ips(config, interface["id"]):
+            raise NetBoxError("unassign VM interface IP addresses in NetBox IPAM before deleting the NetBox VM")
     if args.dry_run:
-        if managed:
-            print(f"WOULD MARK NetBox VM {name} for deletion")
-        if exists:
-            print(f"WOULD UNDEFINE local VM {name}")
-            for path in paths:
-                print(f"WOULD {'PURGE' if args.purge else 'KEEP'} {path}")
-        if managed:
-            print(f"WOULD DELETE NetBox VM {name}")
+        print(f"WOULD DELETE NetBox VM {name} and its inventory components")
         return 0
-    if record:
-        data = record.get("local_context_data") or {}
-        context = dict(data.get("vmctl") or {})
-        previous = context.get("delete_requested")
-        if previous and bool(previous.get("purge")) != args.purge:
-            raise ValueError("retry deletion with the original --purge choice")
-        if not previous:
-            context["delete_requested"] = {"purge": args.purge, "disk_paths": paths}
-            patch_vm(config, record["id"], {"local_context_data": {**data, "vmctl": context},
-                                           "changelog_message": "vmctl requested deletion"})
-    if exists:
-        xml_path = Path(__file__).parent / "state" / "domains" / f"{name}.xml"
-        cloud = ((record or {}).get("local_context_data") or {}).get("vmctl", {}).get("source") == "cloud_image"
-        if not cloud and xml_path.exists():
-            cloud = ET.fromstring(xml_path.read_text(encoding="utf-8")).find("./os[@firmware='efi']") is not None
-        subprocess.run(["virsh", "-c", config["host"]["libvirt_uri"], "undefine", name,
-                        *(["--nvram"] if cloud else [])], check=True)
-        (Path(__file__).parent / "state" / "domains" / f"{name}.xml").unlink(missing_ok=True)
-    if args.purge:
-        for value in paths:
-            Path(value).unlink(missing_ok=True)
-    if record:
-        _request(config, "DELETE", f"virtualization/virtual-machines/{record['id']}/")
-    print(f"Deleted VM {name}; disk files {'purged' if args.purge else 'kept'}")
+    _request(config, "DELETE", f"virtualization/virtual-machines/{record['id']}/")
+    print(f"Deleted NetBox VM {name}")
     return 0
 
 
@@ -1264,181 +1250,179 @@ def shutdown_vm(config: dict, name: str, force: bool, dry_run: bool) -> int:
         time.sleep(min(2, remaining))
 
 
-def provision_command(config: dict, args: argparse.Namespace) -> int:
-    reserved_name = None
-    try:
-        if args.command in ("create", "prepare"):
-            with args.spec.open("rb") as file:
-                request_vm = resolve_creation_spec(tomllib.load(file), config)
-            if args.command == "prepare":
-                require_netbox(config)
-            if not has_netbox_key(config):
-                plan = {
-                    **request_vm,
-                    "bridge": config["network"]["bridge"],
-                    "storage_directory": config["storage"]["directory"],
-                }
-                return create_vm(plan, config, Path(__file__).parent, args.dry_run)
-            if args.dry_run:
-                print(f"NetBox: create planned VM {request_vm['name']} on device {config['netbox']['device']}")
-                guest_name = request_vm.get("interface_name", "eth0")
-                print(f"NetBox: create virtual disk, guest interface {guest_name} and primary MAC")
-                print(f"NetBox context: host TAP {host_interface_name(request_vm['name'], guest_name)} "
-                      f"on {config['network']['bridge']}")
-                if request_vm["source"] == "iso":
-                    print(f"NetBox: create Virtual Disk media-sda for ISO {request_vm['iso']}")
-                if args.command == "prepare":
-                    return 0
-                plan = {
-                    **request_vm,
-                    "bridge": config["network"]["bridge"],
-                    "storage_directory": config["storage"]["directory"],
-                }
-                return create_vm(plan, config, Path(__file__).parent, True)
-            device_id, cluster_id = find_device(config)
-            if args.command == "prepare":
-                existing = find_vm(config, request_vm["name"], cluster_id)
-                if existing:
-                    record = get_vm(config, request_vm["name"], cluster_id, device_id)
-                    context = (record.get("local_context_data") or {}).get("vmctl") or {}
-                    if context.get("version") not in (2, 3, 4) or context.get("source") != request_vm["source"]:
-                        raise NetBoxError("existing NetBox VM does not match this preparation request")
-                else:
-                    reserve_vm(config, request_vm, cluster_id, device_id)
-                    record = get_vm(config, request_vm["name"], cluster_id, device_id)
-            else:
-                reserve_vm(config, request_vm, cluster_id, device_id)
-                record = get_vm(config, request_vm["name"], cluster_id, device_id)
-            reserved_name = request_vm["name"]
-            create_vm_components(config, record, request_vm.get("interface_name", "eth0"),
-                                 request_vm.get("mac_address"),
-                                 request_vm["disk_gb"] * 1024)
-            if args.command == "prepare":
-                print(f"Prepared in NetBox: {request_vm['name']}. Set IPs and display, then run: vmctl sync {request_vm['name']}")
-                return 0
+def prepare_command(config: dict, args: argparse.Namespace) -> int:
+    """Create only the NetBox record and initial inventory components."""
+    require_netbox(config)
+    with args.spec.open("rb") as file:
+        request_vm = resolve_creation_spec(tomllib.load(file), config)
+    if args.dry_run:
+        print(f"NetBox: create planned VM {request_vm['name']} on device {config['netbox']['device']}")
+        guest_name = request_vm.get("interface_name", "eth0")
+        print(f"NetBox: create virtual disk, guest interface {guest_name} and primary MAC")
+        print(f"NetBox context: host TAP {host_interface_name(request_vm['name'], guest_name)} "
+              f"on {config['network']['bridge']}")
+        if request_vm["source"] == "iso":
+            print(f"NetBox: create Virtual Disk media-sda for ISO {request_vm['iso']}")
+        return 0
+    device_id, cluster_id = find_device(config)
+    if find_vm(config, request_vm["name"], cluster_id):
+        record = get_vm(config, request_vm["name"], cluster_id, device_id)
+        context = (record.get("local_context_data") or {}).get("vmctl") or {}
+        if (context.get("version") not in (2, 3, 4) or context.get("source") != request_vm["source"]
+                or context.get("delete_requested")):
+            raise NetBoxError("existing NetBox VM does not match this preparation request")
+        if desired_vm_status(record) != "planned":
+            raise NetBoxError("NetBox VM is already deployed; prepare only creates new planned records")
+    else:
+        reserve_vm(config, request_vm, cluster_id, device_id)
+        record = get_vm(config, request_vm["name"], cluster_id, device_id)
+    create_vm_components(config, record, request_vm.get("interface_name", "eth0"),
+                         request_vm.get("mac_address"), request_vm["disk_gb"] * 1024)
+    print(f"Prepared in NetBox: {request_vm['name']}. Set IPs, Contacts and Context, then run: vmctl create {request_vm['name']}")
+    return 0
+
+
+def desired_vm_status(record: dict) -> str:
+    status = record.get("status")
+    status = status.get("value") if isinstance(status, dict) else status
+    if status not in ("planned", "staged", "offline", "active"):
+        raise NetBoxError(f"VM has unsupported NetBox status: {status!r}")
+    return status
+
+
+def create_command(config: dict, args: argparse.Namespace) -> int:
+    """Deploy a new local guest; never prepare NetBox or sync an existing guest."""
+    target = str(args.target)
+    if not has_netbox_key(config):
+        with Path(target).open("rb") as file:
+            request_vm = resolve_creation_spec(tomllib.load(file), config)
+        return create_vm({**request_vm, "bridge": config["network"]["bridge"],
+                          "storage_directory": config["storage"]["directory"]},
+                         config, Path(__file__).parent, args.dry_run)
+    if not NAME_RE.fullmatch(target):
+        raise ValueError("with NetBox, create requires a VM name, not a TOML path; run prepare FILE first")
+    device_id, cluster_id = find_device(config)
+    record = get_vm(config, target, cluster_id, device_id)
+    if target in local_names(config):
+        raise ValueError(f"local VM {target!r} already exists; use vmctl sync {target} for changes")
+    context = (record.get("local_context_data") or {}).get("vmctl") or {}
+    if context.get("delete_requested"):
+        raise NetBoxError(f"legacy VM deletion is pending; finish vmctl delete netbox {target} before preparing a new record")
+    if context.get("source") == "existing":
+        raise NetBoxError("adopted VM is missing locally; restore it instead of deploying a new image")
+    serial = verify_vm_serial(config, record, False)
+    status = desired_vm_status(record)
+    vm = validate_spec({"vm": local_spec_from_netbox(record, config)})
+    vm["uuid"] = serial
+    if vm["source"] == "cloud_image":
+        vm["cloud_init_data"] = cloud_init_from_netbox(config, record, vm)
+    result = create_vm(vm, config, Path(__file__).parent, args.dry_run)
+    if result == 0 and status == "planned":
+        if args.dry_run:
+            print(f"NetBox: stage {target} after local creation")
         else:
-            require_netbox(config)
-            device_id, cluster_id = find_device(config)
-            record = get_vm(config, args.vm, cluster_id, device_id)
-            context = (record.get("local_context_data") or {}).get("vmctl") or {}
-            serial = verify_vm_serial(config, record, args.vm in local_names(config))
-            if context.get("delete_requested"):
-                raise NetBoxError("VM deletion is pending; retry vmctl delete instead of sync")
-            missing_macs = [item for item in vm_interfaces(config, record["id"])
-                            if not item.get("primary_mac_address")]
-            if missing_macs and args.dry_run:
-                for item in missing_macs:
-                    print(f"WOULD CREATE primary MAC in NetBox for {item['name']}")
-                return 0
-            for item in missing_macs:
-                ensure_primary_mac(config, item)
-        vm = local_spec_from_netbox(record, config)
-        if vm["source"] not in ("iso", "cloud_image", "existing"):
-            raise NetBoxError("NetBox vmctl.source must be 'iso', 'cloud_image' or 'existing'")
-        if vm["source"] == "existing":
-            if args.command != "sync":
-                raise NetBoxError("existing VM records cannot be used as creation requests")
-            if args.vm not in local_names(config):
-                raise NetBoxError("adopted VM is missing locally; restore it before sync")
-        else:
-            vm = validate_spec({"vm": vm})
-        if args.command == "sync":
-            vm["uuid"] = serial
-        desired_status = record.get("status")
-        if isinstance(desired_status, dict):
-            desired_status = desired_status.get("value")
-        if desired_status not in ("planned", "staged", "offline", "active"):
-            raise NetBoxError(f"VM has unsupported NetBox status: {desired_status!r}")
-        if args.command == "sync":
-            existing = subprocess.run(
-                ["virsh", "-c", config["host"]["libvirt_uri"], "list", "--all", "--name"],
-                check=True, capture_output=True, text=True,
-            )
-            if vm["name"] in existing.stdout.splitlines():
-                changed = False
-                try:
-                    verify_local_vm(vm, config)
-                except ValueError:
-                    context = (record.get("local_context_data") or {}).get("vmctl") or {}
-                    if context.get("version") not in (2, 3, 4):
-                        raise
-                    if not args.dry_run:
-                        patch_vm(config, record["id"], {
-                            "status": desired_status,
-                            "changelog_message": "vmctl requested local definition sync",
-                        })
-                    redefine_vm(vm, config, Path(__file__).parent, args.dry_run,
-                                getattr(args, "purge", False), stage_running=True)
-                    changed = True
-                    if not args.dry_run:
-                        verify_local_vm(vm, config)
-                if args.dry_run:
-                    if not changed:
-                        print(f"Local VM definition matches NetBox: {vm['name']}")
-                    if getattr(args, "purge", False) and pending_purge_file(Path(__file__).parent, vm["name"]).exists():
-                        print(f"WOULD RETRY pending disk purge for {vm['name']}")
-                    if desired_status == "planned":
-                        print(f"NetBox: stage {vm['name']}")
-                    if desired_status in ("active", "offline"):
-                        state = subprocess.run(
-                            ["virsh", "-c", config["host"]["libvirt_uri"], "domstate", vm["name"]],
-                            check=True, capture_output=True, text=True,
-                        ).stdout.strip()
-                        power_command = "start" if desired_status == "active" and state == "shut off" else (
-                            "shutdown" if desired_status == "offline" and state == "running" else None
-                        )
-                        if power_command:
-                            print(f"NetBox: set {vm['name']} status to {desired_status}")
-                            print(shlex.join(["virsh", "-c", config["host"]["libvirt_uri"], power_command, vm["name"]]))
-                        if state == "running" and not changed:
-                            try:
-                                verify_local_vm(vm, config, live=True)
-                            except ValueError:
-                                print(f"PENDING RESTART: {vm['name']} needs shutdown and start")
-                    return 0
-                if getattr(args, "purge", False) and not changed and pending_purge_file(Path(__file__).parent, vm["name"]).exists():
-                    patch_vm(config, record["id"], {
-                        "status": desired_status,
-                        "changelog_message": "vmctl requested pending disk purge",
-                    })
-                    purge_pending(vm, config, Path(__file__).parent)
-                state = subprocess.run(
-                    ["virsh", "-c", config["host"]["libvirt_uri"], "domstate", vm["name"]],
-                    check=True, capture_output=True, text=True,
-                ).stdout.strip()
-                if state == "running":
-                    try:
-                        verify_local_vm(vm, config, live=True)
-                    except ValueError:
-                        print(f"Pending restart for {vm['name']}: shutdown and start to apply persistent XML")
-                if desired_status == "planned":
-                    patch_vm(config, record["id"], {"status": "staged"})
-                reconcile_power(config, record, desired_status)
-                print(f"Local VM matches NetBox: {vm['name']}")
-                return 0
-            if not args.dry_run:
-                patch_vm(config, record["id"], {
-                    "status": desired_status,
-                    "changelog_message": "vmctl requested local sync",
-                })
-        if vm["source"] == "cloud_image":
-            vm["cloud_init_data"] = cloud_init_from_netbox(config, record, vm)
-        create_vm(vm, config, Path(__file__).parent, args.dry_run)
-        if not args.dry_run and desired_status == "planned":
             patch_vm(config, record["id"], {"status": "staged"})
-            print(f"NetBox VM {vm['name']} is staged")
-        if args.command == "sync" and desired_status == "active" and not args.dry_run:
-            reconcile_power(config, record, desired_status)
+            print(f"NetBox VM {target} is staged")
+    return result
+
+
+def sync_command(config: dict, args: argparse.Namespace) -> int:
+    """Apply NetBox changes only to a guest which already exists locally."""
+    require_netbox(config)
+    device_id, cluster_id = find_device(config)
+    record = get_vm(config, args.vm, cluster_id, device_id)
+    context = (record.get("local_context_data") or {}).get("vmctl") or {}
+    if context.get("delete_requested"):
+        raise NetBoxError(f"legacy VM deletion is pending; finish vmctl delete netbox {args.vm}")
+    if args.vm not in local_names(config):
+        if context.get("source") == "existing":
+            raise NetBoxError("adopted VM is missing locally; restore it before sync")
+        raise NetBoxError(f"local VM {args.vm!r} is missing; use vmctl create {args.vm}; sync never deploys images")
+    serial = verify_vm_serial(config, record, True)
+    missing_macs = [item for item in vm_interfaces(config, record["id"])
+                    if not item.get("primary_mac_address")]
+    if missing_macs and args.dry_run:
+        for item in missing_macs:
+            print(f"WOULD CREATE primary MAC in NetBox for {item['name']}")
+        return 0
+    for item in missing_macs:
+        ensure_primary_mac(config, item)
+    vm = local_spec_from_netbox(record, config)
+    if vm["source"] != "existing":
+        vm = validate_spec({"vm": vm})
+    vm["uuid"] = serial
+    desired_status = desired_vm_status(record)
+    changed = False
+    try:
+        verify_local_vm(vm, config)
+    except ValueError:
+        if context.get("version") not in (2, 3, 4):
+            raise
+        if not args.dry_run:
+            patch_vm(config, record["id"], {
+                "status": desired_status,
+                "changelog_message": "vmctl requested local definition sync",
+            })
+        redefine_vm(vm, config, Path(__file__).parent, args.dry_run,
+                    getattr(args, "purge", False), stage_running=True)
+        changed = True
+        if not args.dry_run:
+            verify_local_vm(vm, config)
+    if args.dry_run:
+        if not changed:
+            print(f"Local VM definition matches NetBox: {vm['name']}")
+        if getattr(args, "purge", False) and pending_purge_file(Path(__file__).parent, vm["name"]).exists():
+            print(f"WOULD RETRY pending disk purge for {vm['name']}")
+        if desired_status == "planned":
+            print(f"NetBox: stage {vm['name']}")
+        if desired_status in ("active", "offline"):
+            state = subprocess.run(
+                ["virsh", "-c", config["host"]["libvirt_uri"], "domstate", vm["name"]],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            power_command = "start" if desired_status == "active" and state == "shut off" else (
+                "shutdown" if desired_status == "offline" and state == "running" else None)
+            if power_command:
+                print(f"NetBox: set {vm['name']} status to {desired_status}")
+                print(shlex.join(["virsh", "-c", config["host"]["libvirt_uri"], power_command, vm["name"]]))
+            if state == "running" and not changed:
+                try:
+                    verify_local_vm(vm, config, live=True)
+                except ValueError:
+                    print(f"PENDING RESTART: {vm['name']} needs shutdown and start")
+        return 0
+    if getattr(args, "purge", False) and not changed and pending_purge_file(Path(__file__).parent, vm["name"]).exists():
+        patch_vm(config, record["id"], {
+            "status": desired_status,
+            "changelog_message": "vmctl requested pending disk purge",
+        })
+        purge_pending(vm, config, Path(__file__).parent)
+    state = subprocess.run(
+        ["virsh", "-c", config["host"]["libvirt_uri"], "domstate", vm["name"]],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if state == "running":
+        try:
+            verify_local_vm(vm, config, live=True)
+        except ValueError:
+            print(f"Pending restart for {vm['name']}: shutdown and start to apply persistent XML")
+    if desired_status == "planned":
+        patch_vm(config, record["id"], {"status": "staged"})
+    reconcile_power(config, record, desired_status)
+    print(f"Local VM matches NetBox: {vm['name']}")
+    return 0
+
+
+def provision_command(config: dict, args: argparse.Namespace) -> int:
+    try:
+        return {"prepare": prepare_command, "create": create_command, "sync": sync_command}[args.command](config, args)
     except (OSError, tomllib.TOMLDecodeError, ValueError, NetBoxError, subprocess.CalledProcessError) as error:
-        target = getattr(args, "vm", None) or getattr(args, "spec", None)
+        target = getattr(args, "vm", None) or getattr(args, "target", None) or getattr(args, "spec", None)
         print(f"{args.command} {target} failed: {error}", file=sys.stderr)
         print_error_hint(error, args.command, str(target) if target else None)
         if has_netbox_key(config):
             print("NetBox remains the source of truth; inspect its VM record before retrying.", file=sys.stderr)
-        if reserved_name:
-            print(f"Retry: vmctl sync {reserved_name}", file=sys.stderr)
         return 1
-    return 0
 
 
 def sync_all(config: dict, args: argparse.Namespace) -> int:
@@ -1481,17 +1465,23 @@ def main() -> int:
         print_error_hint(error, "config")
         return 2
 
-    if args.command in ("disk", "nic", "delete"):
+    if args.command in ("disk", "nic", "delete", "purge"):
         try:
-            result = delete_vm(config, args) if args.command == "delete" else component_command(config, args)
-            if result == 0 and not args.dry_run:
+            if args.command == "delete":
+                result = delete_vm(config, args)
+            elif args.command == "purge":
+                result = purge_local_disks(config, Path(__file__).parent, args.dry_run)
+            else:
+                result = component_command(config, args)
+            if (result == 0 and not args.dry_run and args.command != "purge"
+                    and not (args.command == "delete" and args.action == "netbox")):
                 refresh_guest_links(config)
             return result
         except (NetBoxError, ValueError, OSError, subprocess.CalledProcessError) as error:
             print(f"{args.command} failed: {error}", file=sys.stderr)
-            print_error_hint(error, args.command, args.vm)
-            if has_netbox_key(config):
-                print("NetBox remains the source of truth; run vmctl audit and retry sync or delete.", file=sys.stderr)
+            print_error_hint(error, args.command, getattr(args, "vm", None))
+            if args.command in ("disk", "nic") and has_netbox_key(config):
+                print("NetBox remains the source of truth; run vmctl audit and retry the component command or sync.", file=sys.stderr)
             return 1
 
     if args.command in ("check", "audit", "adopt"):

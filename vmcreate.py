@@ -427,6 +427,8 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
 
 
 def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
+    if (project_dir / "state" / "local-delete" / f"{vm['name']}.json").exists():
+        raise ValueError(f"unfinished local deletion; retry vmctl delete local {vm['name']} before create")
     disk_dir_value = vm.get("storage_directory")
     bridge = vm.get("bridge")
     if not isinstance(disk_dir_value, str) or not Path(disk_dir_value).is_absolute():
@@ -480,7 +482,7 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
     if not source_path.is_file():
         raise ValueError(f"source image not found: {source_path}")
     if seed and not vm.get("cloud_init_data") and not vm.get("user_data"):
-        raise ValueError("cloud image needs cloud-init data; use NetBox prepare, assign IPs and coreroot Contacts, then sync")
+        raise ValueError("cloud image needs cloud-init data; use NetBox prepare, assign IPs and coreroot Contacts, then create NAME")
     if seed and not vm.get("cloud_init_data") and not Path(vm["user_data"]).is_file():
         raise ValueError(f"cloud-init user-data not found: {vm['user_data']}")
     if seed and not vm.get("cloud_init_data") and vm.get("user_data") and b"REPLACE_WITH_YOUR_PUBLIC_KEY" in Path(vm["user_data"]).read_bytes():
