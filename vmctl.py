@@ -13,6 +13,7 @@ import time
 import tomllib
 import uuid
 import textwrap
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from netbox import (
@@ -22,6 +23,7 @@ from netbox import (
     vm_serial_uuid,
 )
 from inventory import inspect_definition, inspect_display, inspect_vm, local_names
+from cloudinit import cloud_init_from_netbox
 from vmcreate import (NAME_RE, create_vm, host_interface_name, interface_alias, pending_purge_file, purge_pending,
                       redefine_vm, validate_spec, verify_local_vm)
 
@@ -35,11 +37,9 @@ def error_hint(error: Exception, command: str, name: str | None = None) -> str:
     """Give the operator one concrete next check without changing either system."""
     detail = str(error).lower()
     target = name or "ИМЯ"
-    if "cloud_image is not available" in detail:
-        if command == "sync":
-            return ("Создание из cloud image пока не поддерживается. Проверьте эту запись ВМ в NetBox; "
-                    "для новой ВМ подготовьте запрос с source='iso'.")
-        return "Используйте запрос source='iso' с существующим ISO; cloud image запланирован для следующего релиза."
+    if "cloud-init" in detail or "cloud_init" in detail or "gateway" in detail:
+        return ("Проверьте IP на всех VM Interfaces, Contacts с ролью coreroot и полем sshpublickey, "
+                "а также vmctl.cloud_init в Context ВМ/хоста/кластера. Для cloud image нужны virt-install, xorriso и UEFI (OVMF).")
     if "cannot match netbox interface" in detail or "no netbox interface with guest mac" in detail:
         return (f"Сверьте MAC гостя через virsh dumpxml --inactive {target} с Primary MAC VM Interface в NetBox. "
                 "Назначьте правильный Primary MAC; если интерфейс лишний, сначала снимите с него IP в NetBox IPAM. "
@@ -366,10 +366,6 @@ def resolve_creation_spec(data: dict, config: dict) -> dict:
         raise ValueError("VM spec needs a [vm] table")
     if "software" in vm:
         raise ValueError("vm.software is not available in this release; create the VM from an ISO")
-    if vm.get("source") == "cloud_image":
-        raise ValueError("cloud_image is not available in this release; use source='iso' and an ISO file")
-    if vm.get("source") != "iso":
-        raise ValueError("vm.source must be 'iso' in this release")
     hardware_name = vm.get("hardware")
     if hardware_name is None:
         return validate_spec(data)
@@ -719,7 +715,12 @@ def delete_vm(config: dict, args: argparse.Namespace) -> int:
             patch_vm(config, record["id"], {"local_context_data": {**data, "vmctl": context},
                                            "changelog_message": "vmctl requested deletion"})
     if exists:
-        subprocess.run(["virsh", "-c", config["host"]["libvirt_uri"], "undefine", name], check=True)
+        xml_path = Path(__file__).parent / "state" / "domains" / f"{name}.xml"
+        cloud = ((record or {}).get("local_context_data") or {}).get("vmctl", {}).get("source") == "cloud_image"
+        if not cloud and xml_path.exists():
+            cloud = ET.fromstring(xml_path.read_text(encoding="utf-8")).find("./os[@firmware='efi']") is not None
+        subprocess.run(["virsh", "-c", config["host"]["libvirt_uri"], "undefine", name,
+                        *(["--nvram"] if cloud else [])], check=True)
         (Path(__file__).parent / "state" / "domains" / f"{name}.xml").unlink(missing_ok=True)
     if args.purge:
         for value in paths:
@@ -775,10 +776,10 @@ def audit(config: dict) -> int:
             if status in ("active", "offline"):
                 expected["status"] = status
             context = (vm.get("local_context_data") or {}).get("vmctl") or {}
-            supported_context = context.get("version") in (1, 2, 3, 4) and context.get("source") in ("iso", "existing")
+            supported_context = context.get("version") in (1, 2, 3, 4) and context.get("source") in ("iso", "cloud_image", "existing")
             pending_restart = False
             if not supported_context:
-                print(f"INVALID {name}: NetBox VM has no supported vmctl context (release supports ISO and adopted VMs)")
+                print(f"INVALID {name}: NetBox VM has no supported vmctl context")
                 problems += 1
             else:
                 if context["version"] in (2, 3, 4):
@@ -809,6 +810,9 @@ def audit(config: dict) -> int:
                                         for item in spec.get("mounted_media", [])]
                         observed_media = [{key: item[key] for key in ("path", "target", "size_mb") if key in item}
                                           for item in local.get("mounted_media", [])]
+                        if spec.get("source") == "cloud_image":
+                            wanted_media = [{key: item.get(key) for key in ("path", "target")} for item in wanted_media]
+                            observed_media = [{key: item.get(key) for key in ("path", "target")} for item in observed_media]
                         if not pending_restart and wanted_media != observed_media:
                             print(f"DIFF {name} mounted media: NetBox and local CD-ROM sources differ")
                             problems += 1
@@ -1317,8 +1321,6 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
             device_id, cluster_id = find_device(config)
             record = get_vm(config, args.vm, cluster_id, device_id)
             context = (record.get("local_context_data") or {}).get("vmctl") or {}
-            if context.get("source") == "cloud_image":
-                raise NetBoxError("cloud_image is not available in this release; do not sync this VM yet")
             serial = verify_vm_serial(config, record, args.vm in local_names(config))
             if context.get("delete_requested"):
                 raise NetBoxError("VM deletion is pending; retry vmctl delete instead of sync")
@@ -1331,8 +1333,8 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
             for item in missing_macs:
                 ensure_primary_mac(config, item)
         vm = local_spec_from_netbox(record, config)
-        if vm["source"] not in ("iso", "existing"):
-            raise NetBoxError("NetBox vmctl.source must be 'iso' or 'existing' in this release")
+        if vm["source"] not in ("iso", "cloud_image", "existing"):
+            raise NetBoxError("NetBox vmctl.source must be 'iso', 'cloud_image' or 'existing'")
         if vm["source"] == "existing":
             if args.command != "sync":
                 raise NetBoxError("existing VM records cannot be used as creation requests")
@@ -1414,10 +1416,13 @@ def provision_command(config: dict, args: argparse.Namespace) -> int:
                 reconcile_power(config, record, desired_status)
                 print(f"Local VM matches NetBox: {vm['name']}")
                 return 0
-            patch_vm(config, record["id"], {
-                "status": desired_status,
-                "changelog_message": "vmctl requested local sync",
-            })
+            if not args.dry_run:
+                patch_vm(config, record["id"], {
+                    "status": desired_status,
+                    "changelog_message": "vmctl requested local sync",
+                })
+        if vm["source"] == "cloud_image":
+            vm["cloud_init_data"] = cloud_init_from_netbox(config, record, vm)
         create_vm(vm, config, Path(__file__).parent, args.dry_run)
         if not args.dry_run and desired_status == "planned":
             patch_vm(config, record["id"], {"status": "staged"})

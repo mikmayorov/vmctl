@@ -363,6 +363,68 @@ def _list_results(config: dict, path: str) -> list[dict]:
     return records
 
 
+def root_ssh_authorized_keys(config: dict, record: dict) -> list[str]:
+    """Collect coreroot contacts on the VM, device and cluster, then VM overrides."""
+    keys = {}
+
+    def add(value: str, contact_name: str | None = None) -> None:
+        if not isinstance(value, str) or not value.strip():
+            raise NetBoxError("root SSH public key must be a non-empty string")
+        lines = value.splitlines()
+        if len(lines) != 1:
+            raise NetBoxError("each root SSH public key must occupy one line")
+        parts = value.split(None, 2)
+        if len(parts) < 2 or not parts[0].startswith(("ssh-", "ecdsa-", "sk-")):
+            raise NetBoxError("root SSH public key must contain a key type and key data")
+        if contact_name is not None:
+            if not contact_name or "\n" in contact_name or "\r" in contact_name:
+                raise NetBoxError("SSH key contact needs a single-line name")
+            value = f"{parts[0]} {parts[1]} {contact_name}"
+        keys[(parts[0], parts[1])] = value
+
+    contacts = {}
+    for object_type, obj in (("virtualization.virtualmachine", record),
+                             ("dcim.device", record.get("device")),
+                             ("virtualization.cluster", record.get("cluster"))):
+        object_id = obj.get("id") if isinstance(obj, dict) else obj
+        if not object_id:
+            continue
+        query = urllib.parse.urlencode({"object_type": object_type, "object_id": object_id})
+        for assignment in _list_results(config, f"tenancy/contact-assignments/?{query}"):
+            if (assignment.get("role") or {}).get("slug") != "coreroot":
+                continue
+            contact = assignment.get("contact") or {}
+            contact_id = contact.get("id")
+            if not contact_id:
+                raise NetBoxError("coreroot assignment has no contact ID")
+            if contact_id not in contacts:
+                contacts[contact_id] = _request(config, "GET", f"tenancy/contacts/{contact_id}/")
+
+    for contact in contacts.values():
+        value = (contact.get("custom_fields") or {}).get("sshpublickey")
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise NetBoxError("Contact sshpublickey must be a string")
+        for line in value.splitlines():
+            if line.strip():
+                add(line, contact.get("name") or "")
+
+    # Rendered context includes cluster-assigned Config Context; local VM data wins.
+    context = record.get("config_context") or {}
+    local = record.get("local_context_data") or {}
+    extra = []
+    for data in (context, local):
+        cloud = (data.get("vmctl") or {}).get("cloud_init") or {}
+        if "root_ssh_authorized_keys" in cloud:
+            extra = cloud["root_ssh_authorized_keys"]
+    if not isinstance(extra, list):
+        raise NetBoxError("cloud_init.root_ssh_authorized_keys must be a list")
+    for value in extra:
+        add(value)
+    return list(keys.values())
+
+
 def named_media(vm: dict) -> list[dict]:
     result = []
     for index, item in enumerate(vm.get("mounted_media", [])):
@@ -832,8 +894,11 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
             wanted = {"name": interface_name, "mac_address": primary_mac["mac_address"], "bridge": bridge}
             if host_dev:
                 wanted["host_dev"] = host_dev
+            addresses = interface_ips(config, item["id"])
+            if context.get("source") == "cloud_image":
+                wanted["addresses"] = [address["address"] for address in addresses]
             wanted_interfaces.append(wanted)
-            ip_ids.update(item["id"] for item in interface_ips(config, item["id"]))
+            ip_ids.update(item["id"] for item in addresses)
         if len({item["name"] for item in wanted_interfaces}) != len(wanted_interfaces):
             raise NetBoxError("duplicate NetBox interface name")
         if layout is not None and len({item["host_dev"] for item in wanted_interfaces}) != len(wanted_interfaces):
@@ -857,4 +922,9 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
             result["interface_name"] = wanted_interfaces[0]["name"]
             result["mac_address"] = wanted_interfaces[0]["mac_address"]
             result["bridge"] = wanted_interfaces[0]["bridge"]
+    if result["source"] == "cloud_image":
+        directory = result.get("storage_directory") or (config or {}).get("storage", {}).get("directory")
+        if not isinstance(directory, str) or not Path(directory).is_absolute():
+            raise NetBoxError("cloud image needs an absolute storage_directory")
+        result["mounted_media"] = [{"path": str(Path(directory) / f"{name}-seed.iso"), "target": "sda"}]
     return result

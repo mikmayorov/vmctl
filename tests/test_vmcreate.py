@@ -487,14 +487,15 @@ class OperationOrderTests(unittest.TestCase):
         self.assertIn("Что сделать: Проверьте virsh dumpxml --inactive bad", errors.getvalue())
         self.assertIn("Adoption: 2 VM(s), 1 successful, 1 failure(s)", output.getvalue())
 
-    def test_release_rejects_cloud_image_before_netbox_or_libvirt_write(self):
+    def test_cloud_image_request_resolves_hardware_without_user_data(self):
         request = {"vm": {"name": "guest", "hardware": "small", "source": "cloud_image",
-                          "image": "/images/base.img", "user_data": "/images/user-data"}}
-        with self.assertRaisesRegex(ValueError, "cloud_image is not available"):
-            vmctl.resolve_creation_spec(request, {"hardware": {"small": {
-                "vcpus": 2, "memory_mb": 2048, "disk_gb": 20}}})
+                          "image": "/images/base.img"}}
+        resolved = vmctl.resolve_creation_spec(request, {"hardware": {"small": {
+            "vcpus": 2, "memory_mb": 2048, "disk_gb": 20}}})
+        self.assertEqual(resolved["source"], "cloud_image")
+        self.assertEqual(resolved["disk_gb"], 20)
 
-    def test_cloud_image_sync_stops_before_mac_or_local_write(self):
+    def test_cloud_image_sync_stops_on_invalid_serial_before_mac_or_local_write(self):
         config = {"netbox": {"key": "secret"}}
         args = Namespace(command="sync", vm="guest", dry_run=False, purge=False)
         record = {"id": 5, "name": "guest", "local_context_data": {
@@ -502,16 +503,17 @@ class OperationOrderTests(unittest.TestCase):
         with (
             patch("vmctl.find_device", return_value=(12, 7)),
             patch("vmctl.get_vm", return_value=record),
-            patch("vmctl.verify_vm_serial") as serial,
+            patch("vmctl.local_names", return_value=[]),
+            patch("vmctl.verify_vm_serial", side_effect=netbox.NetBoxError("invalid Serial")) as serial,
             patch("vmctl.ensure_primary_mac") as mac,
             patch("vmctl.create_vm") as local,
             contextlib.redirect_stderr(io.StringIO()) as errors,
         ):
             self.assertEqual(vmctl.provision_command(config, args), 1)
-        serial.assert_not_called()
+        serial.assert_called_once()
         mac.assert_not_called()
         local.assert_not_called()
-        self.assertIn("cloud_image is not available", errors.getvalue())
+        self.assertIn("invalid Serial", errors.getvalue())
 
     def test_interface_adopt_error_suggests_mac_and_ip_checks(self):
         hint = vmctl.error_hint(netbox.NetBoxError(

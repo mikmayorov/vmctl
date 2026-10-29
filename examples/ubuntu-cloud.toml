@@ -1,0 +1,150 @@
+# Ubuntu Cloud Image: запрос на создание виртуальной машины через NetBox.
+#
+# ШАГИ СОЗДАНИЯ (на хосте виртуализации, команды от root)
+#
+# 1. Установите инструменты и проверьте конфигурацию хоста:
+#      apt install virtinst xorriso ovmf
+#      vmctl check
+#    В config.toml должны быть настроены libvirt, storage.directory, network.bridge
+#    и подключение к NetBox. Каталог дисков и сетевой мост должны существовать.
+#    Образ должен уже лежать по пути image ниже. Вариант amd64v3 требует CPU
+#    с поддержкой x86-64-v3; ВМ создаётся с UEFI без Secure Boot
+#    и CPU host-passthrough, как и cloud-ВМ Debian/Arch.
+#
+# 2. Скопируйте пример и отредактируйте запрос:
+#      cd /opt/vmctl
+#      mkdir -p local
+#      cp examples/ubuntu-cloud.toml local/guest.toml
+#      editor local/guest.toml
+#    Задайте уникальное name, описание, hardware и путь image.
+#    Во всех командах ниже замените example-ubuntu на выбранное name.
+#
+# 3. Проверьте план и создайте запись ВМ с начальным диском и NIC в NetBox:
+#      vmctl --dry-run prepare local/guest.toml
+#      vmctl prepare local/guest.toml
+#    Локальные диски и домен libvirt на этом шаге ещё не создаются.
+#
+# 4. В NetBox подготовьте параметры первого запуска:
+#    - Назначьте статические IPv4/IPv6 с префиксами всем VM Interfaces этой ВМ.
+#      Primary IP ВМ — необязательный выбор основного адреса; одного Primary IP
+#      без назначения адреса интерфейсу недостаточно.
+#    - Назначьте Contacts с ролью (slug) coreroot на ВМ, Device гипервизора
+#      и/или кластер. Заполните публичные ключи в custom field sshpublickey.
+#      Можно указать несколько ключей отдельными строками. Комментарий ключа
+#      будет заменён именем Contact; ключи всех трёх уровней объединяются.
+#    - При необходимости задайте шлюзы, DNS и дополнительные ключи в Context
+#      по примеру в конце этого файла. Нужен хотя бы один ключ root.
+#    - Проверьте мост и имя TAP в существующем vmctl.interfaces, при желании
+#      настройте vmctl.display. Сохраняйте остальные поля Context от prepare.
+#    API-пользователю vmctl нужен доступ на чтение Contacts и их назначений.
+#
+# 5. Проверьте план и создайте выключенную ВМ на хосте:
+#      vmctl --dry-run sync example-ubuntu
+#      vmctl sync example-ubuntu
+#    vmctl создаст самостоятельный qcow2 из image, увеличит его до размера
+#    из hardware и подключит постоянный NoCloud seed с настройками из NetBox.
+#    Исходный образ не изменяется. virt-install --cloud-init формирует XML
+#    первого запуска; vmctl определяет ВМ без её запуска.
+#
+# 6. Запустите ВМ и проверьте состояние:
+#      vmctl start example-ubuntu
+#      vmctl check example-ubuntu
+#    Дождитесь настройки cloud-init, затем подключитесь по назначенному IP:
+#      ssh root@192.0.2.10
+#    На своём рабочем компьютере используйте приватный ключ, соответствующий
+#    одному из публичных ключей в NetBox. Внутри гостя можно проверить:
+#      cloud-init status --wait
+#      ip address
+#      ip route
+#      ip -6 route
+#
+# ВАЖНО О ПЕРВОМ ЗАПУСКЕ
+# Cloud-init задаёт hostname, ключи root и статическую сеть, отключает вход
+# по SSH-паролю и расширяет корневую файловую систему. Последующие sync
+# существующей ВМ не пересоздают seed и не обновляют ключи/сеть внутри гостя.
+# После prepare источником параметров становится NetBox, а не этот TOML.
+# Если создание прервалось после записи диска, проверьте оставшиеся файлы:
+# vmctl намеренно не перезаписывает существующий диск cloud image при повторе.
+#
+# ПОЛЯ ЗАПРОСА
+
+[vm]
+# Уникальное имя ВМ в NetBox/libvirt. Также используется в именах файлов дисков.
+# Допустимы 1–64 латинские буквы, цифры, точки, подчёркивания и дефисы;
+# первый символ — буква или цифра.
+name = "example-ubuntu"
+
+# Необязательное описание: записывается в NetBox и XML домена libvirt.
+description = "Ubuntu Server 26.04 Cloud Image"
+
+# Для готового установленного образа диска, а не установочного ISO.
+source = "cloud_image"
+
+# Профиль CPU, памяти и начального диска из [hardware.small] в config.toml.
+# В типовом config.example.toml: 2 vCPU, 2048 МиБ RAM, диск 20 ГиБ.
+# Вместо hardware можно указать три значения явно (раскомментируйте их
+# и удалите hardware). Сочетать hardware и явные размеры нельзя.
+hardware = "small"
+# vcpus = 2
+# memory_mb = 2048
+# disk_gb = 20
+
+# Абсолютный путь к исходному Ubuntu Cloud Image на хосте виртуализации.
+# Размер диска из hardware/disk_gb должен быть не меньше virtual-size образа:
+#   qemu-img info /var/lib/libvirt/images-ro/ubuntu-26.04-server-cloudimg-amd64v3.img
+# Рабочий qcow2 создаётся в storage.directory из config.toml.
+image = "/var/lib/libvirt/images-ro/ubuntu-26.04-server-cloudimg-amd64v3.img"
+
+# Необязательное логическое имя первого VM Interface в NetBox.
+# По умолчанию eth0. Внутри Ubuntu имя может отличаться: cloud-init сопоставляет
+# интерфейс по MAC. Мост берётся из network.bridge конфигурации хоста.
+# interface_name = "eth0"
+
+# Необязательный MAC гостевого NIC. Без этого поля vmctl создаст его сам.
+# Если задаёте вручную, MAC должен быть уникальным в вашей сети.
+# mac_address = "52:54:00:12:34:56"
+
+# ПРИМЕР НАСТРОЕК В NETBOX CONTEXT (это JSON, а не поля данного TOML)
+#
+# Добавьте cloud_init внутрь уже существующего объекта vmctl в Local Context
+# Data ВМ. Не заменяйте весь Context: сохраните version, source, image,
+# storage_directory, interfaces, display и остальные поля от prepare.
+# Адреса ниже иллюстративные: замените их значениями своего сегмента.
+#
+# {
+#   "vmctl": {
+#     "cloud_init": {
+#       "dns_servers": ["192.0.2.53", "2001:db8::53"],
+#       "search_domains": ["example.org"],
+#       "network": {
+#         "eth0": {
+#           "gateway4": "192.0.2.1",
+#           "gateway6": "2001:db8::1"
+#         }
+#       },
+#       "root_ssh_authorized_keys": [
+#         "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY additional-admin"
+#       ]
+#     }
+#   }
+# }
+#
+# - IP с префиксами здесь не дублируются: они читаются из NetBox IPAM отдельно
+#   для каждого VM Interface. DHCP и принятие IPv6 RA отключены.
+# - Ключи network — имена VM Interfaces. Для общих настроек сегмента можно
+#   использовать имя моста, например br0; настройка по имени NIC приоритетнее.
+# - dns_servers и search_domains можно переопределить внутри конкретного NIC.
+# - Если gateway4/gateway6 отсутствует, vmctl ищет однозначный default route
+#   хоста через соответствующий мост. IP самого моста шлюзом не считается.
+#   При отсутствии подходящего маршрута default route гостю не задаётся.
+#   Значение null явно отключает поиск шлюза данного семейства на интерфейсе.
+#   Поддерживается один default route IPv4 и один IPv6 на ВМ.
+# - Общие параметры можно задать через Config Context, назначенный кластеру,
+#   либо в Context Device гипервизора. Приоритет: локальный Context ВМ выше
+#   Context хоста, Context хоста выше общего Config Context ВМ/кластера.
+# - root_ssh_authorized_keys необязателен, если ключи получены из Contacts.
+#   Удалите это поле либо замените REPLACE_WITH_PUBLIC_KEY настоящим ключом.
+#   Ключ из Context сохраняется без изменения комментария и имеет приоритет
+#   над тем же ключом из Contacts. Дубликаты удаляются по типу и данным ключа.
+#
+# Полное описание: README.md, раздел «Cloud Images и cloud-init».

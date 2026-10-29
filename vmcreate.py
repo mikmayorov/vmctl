@@ -110,10 +110,13 @@ def validate_spec(data: dict) -> dict:
     source = vm.get("source")
     if source not in ("iso", "cloud_image"):
         raise ValueError("vm.source must be 'iso' or 'cloud_image'")
-    for field in (("iso",) if source == "iso" else ("image", "user_data")):
+    for field in (("iso",) if source == "iso" else ("image",)):
         value = vm.get(field)
         if not isinstance(value, str) or not Path(value).is_absolute():
             raise ValueError(f"vm.{field} must be an absolute path on the host")
+    if source == "cloud_image" and vm.get("user_data") is not None:
+        if not isinstance(vm["user_data"], str) or not Path(vm["user_data"]).is_absolute():
+            raise ValueError("vm.user_data must be an absolute path on the host")
     if "description" in vm and not isinstance(vm["description"], str):
         raise ValueError("vm.description must be a string")
     if "interface_name" in vm and (not isinstance(vm["interface_name"], str) or not vm["interface_name"]):
@@ -453,6 +456,9 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
         "-graft-points", f"user-data={seed_dir / 'user-data'}",
         f"meta-data={seed_dir / 'meta-data'}",
     ] if seed else None
+    if seed_cmd and vm.get("cloud_init_data", {}).get("network-config"):
+        seed_cmd.append(f"network-config={seed_dir / 'network-config'}")
+    cloud_command = cloud_install_command(vm, uri, wanted_disks, seed_dir) if seed else None
     define_cmd = ["virsh", "-c", uri, "define", str(xml_path)]
     print(f"Source: {vm['iso'] if vm['source'] == 'iso' else vm['image']}")
     print(f"Bridge: {bridge}")
@@ -465,15 +471,19 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
             print(shlex.join(command))
         if seed_cmd:
             print(shlex.join(seed_cmd))
+        if cloud_command:
+            print(shlex.join(cloud_command))
         print(shlex.join(define_cmd))
         return 0
 
     source_path = Path(vm["iso"] if vm["source"] == "iso" else vm["image"])
     if not source_path.is_file():
         raise ValueError(f"source image not found: {source_path}")
-    if seed and not Path(vm["user_data"]).is_file():
+    if seed and not vm.get("cloud_init_data") and not vm.get("user_data"):
+        raise ValueError("cloud image needs cloud-init data; use NetBox prepare, assign IPs and coreroot Contacts, then sync")
+    if seed and not vm.get("cloud_init_data") and not Path(vm["user_data"]).is_file():
         raise ValueError(f"cloud-init user-data not found: {vm['user_data']}")
-    if seed and b"REPLACE_WITH_YOUR_PUBLIC_KEY" in Path(vm["user_data"]).read_bytes():
+    if seed and not vm.get("cloud_init_data") and vm.get("user_data") and b"REPLACE_WITH_YOUR_PUBLIC_KEY" in Path(vm["user_data"]).read_bytes():
         raise ValueError("replace the example SSH public key in cloud-init user-data")
     if not disk_dir.is_dir():
         raise ValueError(f"storage directory not found: {disk_dir}")
@@ -515,6 +525,10 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
 
     if seed and shutil.which("xorriso") is None:
         raise ValueError("xorriso is required for cloud images")
+    if seed and shutil.which("virt-install") is None:
+        raise ValueError("virt-install is required for cloud images")
+    if seed and not any(shutil.which(tool) for tool in ("xorrisofs", "genisoimage", "mkisofs")):
+        raise ValueError("virt-install --cloud-init needs xorrisofs, genisoimage or mkisofs")
     if seed:
         info = subprocess.run(
             ["qemu-img", "info", "--output=json", str(source_path)],
@@ -532,15 +546,87 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
             subprocess.run(["qemu-img", "create", "-f", "qcow2", item["path"], f"{item['size_gb']}G"], check=True)
     if seed and seed_cmd:
         seed_dir.mkdir(parents=True, exist_ok=True)
-        (seed_dir / "user-data").write_bytes(Path(vm["user_data"]).read_bytes())
-        (seed_dir / "meta-data").write_text(
-            f"instance-id: {vm['name']}\nlocal-hostname: {vm['name']}\n", encoding="utf-8",
-        )
+        seed_dir.chmod(0o700)
+        inputs = vm.get("cloud_init_data") or {
+            "user-data": Path(vm["user_data"]).read_text(encoding="utf-8"),
+            "meta-data": json.dumps({"instance-id": vm.get("uuid") or vm["name"], "local-hostname": vm["name"]}) + "\n",
+        }
+        for name, content in inputs.items():
+            if name not in ("user-data", "meta-data", "network-config"):
+                raise ValueError(f"unsupported cloud-init file: {name}")
+            (seed_dir / name).write_text(content, encoding="utf-8")
         subprocess.run(seed_cmd, check=True)
+    xml = domain_xml(vm, disk, bridge, seed)
+    if cloud_command:
+        try:
+            generated = subprocess.run(cloud_command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as error:
+            raise ValueError(f"virt-install --cloud-init failed: {error.stderr or error}") from error
+        xml = persistent_cloud_xml(generated.stdout, vm, disk, bridge, seed)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=xml_path.parent, prefix=f".{vm['name']}-", delete=False) as file:
         temporary_xml = Path(file.name)
-        file.write(domain_xml(vm, disk, bridge, seed))
+        file.write(xml)
     os.replace(temporary_xml, xml_path)
     subprocess.run(define_cmd, check=True)
     print(f"VM defined: {vm['name']}. Start it with: vmctl start {vm['name']}")
     return 0
+
+
+def cloud_install_command(vm: dict, uri: str, disks: list[dict], seed_dir: Path) -> list[str]:
+    """Ask virt-install for the first-boot XML without starting a guest."""
+    command = ["virt-install", "--connect", uri, "--name", vm["name"],
+               "--memory", str(vm["memory_mb"]), "--vcpus", str(vm["vcpus"]),
+               "--import", "--osinfo", "generic", "--cpu", "host-passthrough",
+               "--machine", "q35", "--boot",
+               "uefi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=no",
+               "--graphics", "none",
+               "--noautoconsole", "--print-xml=1"]
+    if vm.get("uuid"):
+        command.extend(["--uuid", vm["uuid"]])
+    for disk in disks:
+        command.extend(["--disk", f"path={disk['path']},format=qcow2,bus=virtio"])
+    for item in vm_interfaces(vm, vm["bridge"]):
+        option = f"bridge={item['bridge']},model=virtio"
+        if item.get("mac_address"):
+            option += f",mac={item['mac_address']}"
+        command.extend(["--network", option])
+    cloud = f"user-data={seed_dir / 'user-data'},meta-data={seed_dir / 'meta-data'}"
+    if vm.get("cloud_init_data", {}).get("network-config"):
+        cloud += f",network-config={seed_dir / 'network-config'}"
+    command.extend(["--cloud-init", cloud])
+    return command
+
+
+def persistent_cloud_xml(xml: str, vm: dict, disk: Path, bridge: str, seed: Path) -> str:
+    """Replace virt-install's temporary seed by our persistent copy."""
+    root = ET.fromstring(xml)
+    devices = root.find("devices")
+    if devices is None:
+        raise ValueError("virt-install returned XML without devices")
+    cdroms = devices.findall("./disk[@device='cdrom']/source")
+    if len(cdroms) != 1:
+        raise ValueError("virt-install must return exactly one cloud-init CD-ROM")
+    cdroms[0].set("file", str(seed))
+    cdrom = devices.find("./disk[@device='cdrom']")
+    target = cdrom.find("target")
+    if target is not None:
+        target.attrib = {"dev": "sda", "bus": "sata"}
+    # The generated address may refer to a SCSI controller; libvirt assigns SATA.
+    address = cdrom.find("address")
+    if address is not None:
+        cdrom.remove(address)
+    expected = ET.fromstring(domain_xml(vm, disk, bridge, seed))
+    # Preserve vmctl's stable aliases/TAP names and display configuration.
+    for node in devices.findall("interface") + devices.findall("graphics"):
+        devices.remove(node)
+    for node in expected.findall("./devices/interface") + expected.findall("./devices/graphics"):
+        devices.append(node)
+    description = root.find("description")
+    if description is None:
+        description = ET.SubElement(root, "description")
+    description.text = vm.get("description") or ""
+    on_reboot = root.find("on_reboot")
+    if on_reboot is not None:
+        on_reboot.text = "restart"
+    ET.indent(root)
+    return ET.tostring(root, encoding="unicode") + "\n"

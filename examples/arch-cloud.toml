@@ -1,0 +1,130 @@
+# Arch Linux Cloud Image: запрос на создание ВМ через NetBox.
+#
+# ШАГИ СОЗДАНИЯ (на хосте виртуализации, от root)
+#
+# 1. Подготовьте хост. Для Ubuntu/Debian-хоста:
+#      apt install virtinst xorriso ovmf
+#      vmctl check
+#    В config.toml настройте libvirt, storage.directory, network.bridge и NetBox.
+#    Рабочий каталог дисков и мост должны существовать. Arch — гостевая ОС,
+#    переустанавливать хост не требуется. Используются q35, virtio,
+#    CPU host-passthrough и UEFI без Secure Boot для загрузчика Arch.
+#
+# 2. Скачайте официальный cloudimg из проекта Arch Linux arch-boxes:
+#      install -d /var/lib/libvirt/images-ro
+#      curl -fL -o /var/lib/libvirt/images-ro/Arch-Linux-x86_64-cloudimg.qcow2 \
+#        https://fastly.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+#    Нужен именно cloudimg с установленным cloud-init, а не basic или ISO.
+#    Arch — rolling release: latest меняется; можно хранить отдельные сборки
+#    под своими именами и указывать точный путь image.
+#
+# 3. Скопируйте пример и отредактируйте поля [vm]:
+#      cd /opt/vmctl
+#      mkdir -p local
+#      cp examples/arch-cloud.toml local/arch.toml
+#      editor local/arch.toml
+#    Во всех командах замените example-arch на выбранное name.
+#
+# 4. Создайте начальную запись ВМ, диск и интерфейс в NetBox:
+#      vmctl --dry-run prepare local/arch.toml
+#      vmctl prepare local/arch.toml
+#    Домен libvirt и локальные диски на этом шаге ещё не создаются.
+#
+# 5. В NetBox назначьте статические IPv4/IPv6 с префиксами всем VM Interfaces.
+#    При необходимости выберите Primary IP ВМ; адрес всё равно должен быть
+#    назначен интерфейсу. Проверьте мост/TAP в vmctl.interfaces.
+#    Назначьте Contacts с ролью (slug) coreroot на ВМ, Device хоста и/или
+#    кластер. В custom field sshpublickey укажите публичные ключи, по одному
+#    на строку. Комментарий будет заменён именем Contact. Можно добавить ключи
+#    в Context ВМ (пример ниже); требуется хотя бы один ключ root.
+#    У API-пользователя должен быть доступ к Contacts и их назначениям.
+#
+# 6. Настройте шлюзы и DNS в Context (см. ниже), затем создайте выключенную ВМ:
+#      vmctl --dry-run sync example-arch
+#      vmctl sync example-arch
+#    Создаётся самостоятельный qcow2 нужного размера и постоянный NoCloud seed.
+#    virt-install --cloud-init формирует XML; исходный образ не изменяется.
+#
+# 7. Запустите ВМ, дождитесь настройки и подключитесь со своего компьютера:
+#      vmctl start example-arch
+#      vmctl check example-arch
+#      ssh root@192.0.2.10
+#    Используйте приватный ключ, соответствующий одному из ключей NetBox.
+#    Проверки внутри гостя:
+#      cloud-init status --wait
+#      ip address
+#      ip route
+#      ip -6 route
+#
+# Cloud-init уже установлен в cloudimg и сам определяет Arch и сетевой backend
+# образа. Не нужны установка пакетов Ubuntu или смена system_info.distro.
+# Доступ настраивается для root, независимо от стандартного пользователя arch.
+# SSH-аутентификация паролем отключена; корневая файловая система расширяется.
+# После prepare параметры берутся из NetBox, а не из этого TOML. Следующие sync
+# существующей ВМ не обновляют ключи/сеть внутри гостя и не пересоздают seed.
+# При ошибке создания проверьте оставшиеся диск, seed и state/cloud-init/<имя>:
+# повторная команда намеренно не перезаписывает существующий cloud-диск.
+
+[vm]
+# Уникальное имя NetBox/libvirt: 1–64 латинских букв, цифр, . _ -;
+# первый символ — буква или цифра. Используется также в именах файлов.
+name = "example-arch"
+
+# Необязательное описание для NetBox и XML домена.
+description = "Arch Linux rolling Cloud Image"
+
+# Общий режим для Ubuntu, Debian и Arch: импорт готового диска с cloud-init.
+source = "cloud_image"
+
+# Профиль из config.toml. Типовой small: 2 vCPU, 2048 МиБ, диск 20 ГиБ.
+# Вместо hardware можно задать ВСЕ три размера ниже; сочетать способы нельзя.
+hardware = "small"
+# vcpus = 2
+# memory_mb = 2048
+# disk_gb = 20
+
+# Абсолютный путь к шаблону на хосте. Размер рабочего диска должен быть
+# не меньше virtual-size из: qemu-img info /путь/к/образу.qcow2
+# Рабочие диски размещаются в storage.directory из config.toml.
+image = "/var/lib/libvirt/images-ro/Arch-Linux-x86_64-cloudimg.qcow2"
+
+# Необязательное имя первого NIC в NetBox, по умолчанию eth0. Сопоставление
+# внутри гостя идёт по MAC; переименовывать интерфейс Arch не требуется.
+# Мост берётся из network.bridge конфигурации хоста.
+# interface_name = "eth0"
+
+# Необязательный уникальный MAC гостевого NIC. Без поля генерируется vmctl.
+# mac_address = "52:54:00:12:34:58"
+
+# NETBOX CONTEXT: JSON-фрагмент, а не поля данного TOML.
+# Добавьте cloud_init в существующий vmctl в Local Context Data ВМ.
+# Сохраните остальные поля от prepare: version, source, image, interfaces и др.
+# Замените демонстрационные адреса и ключ значениями своего сегмента:
+# {
+#   "vmctl": {
+#     "cloud_init": {
+#       "dns_servers": ["192.0.2.53", "2001:db8::53"],
+#       "search_domains": ["example.org"],
+#       "network": {
+#         "eth0": {"gateway4": "192.0.2.1", "gateway6": "2001:db8::1"}
+#       },
+#       "root_ssh_authorized_keys": [
+#         "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY additional-admin"
+#       ]
+#     }
+#   }
+# }
+#
+# IP с префиксами читаются из IPAM для каждого NIC, здесь их не дублируйте.
+# DHCP и IPv6 RA отключены. Ключи network — имена NIC или мостов (например br0);
+# имя NIC приоритетнее. DNS/search domains можно переопределить внутри NIC.
+# Шлюз без явной настройки ищется в default routes хоста через нужный мост,
+# с проверкой подсети. IP моста не считается шлюзом автоматически.
+# Нет подходящего маршрута — нет default route у гостя. gateway4/gateway6: null
+# явно отключает поиск. Поддерживается один default route на семейство IP.
+# Приоритет настроек: локальный Context ВМ > Context Device хоста > общий
+# Config Context ВМ, в том числе назначенный кластеру.
+# root_ssh_authorized_keys необязателен при наличии ключей Contacts: удалите
+# поле или замените REPLACE_WITH_PUBLIC_KEY реальным ключом. Ключи из Context
+# не меняются и при совпадении имеют приоритет над Contacts; дубликаты убираются.
+# Подробности: README.md, раздел «Cloud Images и cloud-init».
