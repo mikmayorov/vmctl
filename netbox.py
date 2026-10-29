@@ -754,6 +754,8 @@ def reserve_vm(config: dict, vm: dict, cluster_id: int, device_id: int) -> dict:
             }
         },
     }
+    if vm.get("hardware"):
+        payload["local_context_data"]["vmctl"]["hardware"] = vm["hardware"]
     result = _request(config, "POST", "virtualization/virtual-machines/", payload)
     print(f"Planned in NetBox: {vm['name']} (ID {result['id']})")
     return result
@@ -802,6 +804,8 @@ def local_spec_from_netbox(record: dict, config: dict | None = None) -> dict:
         "bridge": context.get("bridge"),
         "storage_directory": context.get("storage_directory"),
     }
+    if context.get("hardware"):
+        result["hardware"] = context["hardware"]
     if context["version"] in (2, 3, 4):
         if config is None:
             raise NetBoxError("NetBox VM inventory needs a NetBox connection")

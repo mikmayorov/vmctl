@@ -51,6 +51,8 @@
 #      vmctl create example-debian
 #    Создаётся самостоятельный qcow2 нужного размера и постоянный NoCloud seed.
 #    virt-install --cloud-init формирует XML; исходный образ не изменяется.
+#    Сводка create покажет ресурсы, образ, источники Context и итоговые IP,
+#    шлюзы/DNS. Для имён Config Contexts нужно необязательное view extras.configcontext.
 #
 # 7. Запустите ВМ, дождитесь настройки и подключитесь со своего компьютера:
 #      vmctl start example-debian
@@ -74,6 +76,12 @@
 # и сетевой backend образа; пакеты Ubuntu и netplan в госте не требуются.
 # Доступ настраивается для root, а не стандартного cloud-пользователя debian.
 # SSH-аутентификация паролем отключена; корневая файловая система расширяется.
+# Пароль консоли задаётся строкой vmctl.cloud_init.root_password. Отсутствие поля
+# или "" выбирает пустой пароль через passwd -d root на финальном этапе:
+#   virsh -c qemu:///system console example-debian
+# Введите root в login: и заданный пароль, если он не пустой; выход — Ctrl + ].
+# SSH остаётся по ключам. До настройки cloud-init пароль root заблокирован;
+# для существующей ВМ используйте passwd root или passwd -d root, а не sync.
 # После prepare параметры берутся из NetBox, а не из этого TOML. Следующие sync
 # существующей ВМ не обновляют ключи/сеть внутри гостя и не пересоздают seed.
 # При ошибке создания проверьте оставшиеся диск, seed и state/cloud-init/<имя>:
@@ -130,6 +138,7 @@ image = "/var/lib/libvirt/images-ro/debian-13-genericcloud-amd64.qcow2"
 # {
 #   "vmctl": {
 #     "cloud_init": {
+#       "root_password": "",
 #       "dns_servers": ["192.0.2.53", "2001:db8::53"],
 #       "search_domains": ["example.org"],
 #       "network": {
@@ -142,6 +151,10 @@ image = "/var/lib/libvirt/images-ro/debian-13-genericcloud-amd64.qcow2"
 #   }
 # }
 #
+# root_password расположен внутри vmctl.cloud_init. Непустая строка задаёт
+# пароль консоли, отсутствие поля/"" — пустой. Пустая строка переопределяет
+# унаследованный пароль; null не принимается. Значение хранится в NetBox и
+# user-data/seed открытым текстом, но в сводке create не выводится.
 # IP с префиксами читаются из IPAM для каждого NIC, здесь их не дублируйте.
 # DHCP и IPv6 RA отключены. Ключи network — имена NIC или мостов (например br0);
 # имя NIC приоритетнее. DNS/search domains можно переопределить внутри NIC.

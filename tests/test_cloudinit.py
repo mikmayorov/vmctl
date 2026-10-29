@@ -36,6 +36,7 @@ class CloudInitTests(unittest.TestCase):
         self.assertEqual(user["users"][0]["ssh_authorized_keys"], self.settings["root_ssh_authorized_keys"])
         self.assertFalse(user["disable_root"])
         self.assertFalse(user["ssh_pwauth"])
+        self.assertIn(["passwd", "-d", "root"], user["runcmd"])
         self.assertEqual(json.loads(data["meta-data"])["instance-id"], self.vm["uuid"])
         nic = json.loads(data["network-config"])["ethernets"]["nic0"]
         self.assertEqual(nic["match"]["macaddress"], "52:54:00:00:00:01")
@@ -43,6 +44,67 @@ class CloudInitTests(unittest.TestCase):
         self.assertFalse(nic["accept-ra"])
         self.assertEqual(len(nic["routes"]), 2)
         self.assertEqual(nic["nameservers"]["addresses"], ["192.0.2.53"])
+
+    def test_absent_or_empty_root_password_selects_passwordless_console(self):
+        for settings in (self.settings, {**self.settings, "root_password": ""}):
+            with self.subTest(explicit="root_password" in settings):
+                data = cloudinit.cloud_init_data(self.vm, settings)
+                user = json.loads(data["user-data"].split("\n", 1)[1])
+                self.assertEqual(user["runcmd"], [["passwd", "-d", "root"]])
+                self.assertNotIn("chpasswd", user)
+                self.assertFalse(user["ssh_pwauth"])
+
+    def test_root_password_is_literal_data_not_a_hash_random_password_or_shell_command(self):
+        for password in ("RANDOM", '$6$literal: "пароль"; $(touch /tmp/never) '):
+            with self.subTest(password=password):
+                data = cloudinit.cloud_init_data(self.vm, {**self.settings, "root_password": password})
+                user = json.loads(data["user-data"].split("\n", 1)[1])
+                self.assertEqual(user["chpasswd"], {"expire": False, "users": [
+                    {"name": "root", "password": password, "type": "text"}]})
+                self.assertNotIn("runcmd", user)
+                self.assertFalse(user["ssh_pwauth"])
+                self.assertEqual(user["users"][0]["ssh_authorized_keys"], self.settings["root_ssh_authorized_keys"])
+
+    def test_invalid_root_password_is_rejected_without_echoing_it(self):
+        for password in (None, False, 42, "secret\nvalue", "secret\rvalue", "secret\0value"):
+            with self.subTest(password=password):
+                with self.assertRaisesRegex(netbox.NetBoxError, "vmctl.cloud_init.root_password") as error:
+                    cloudinit.cloud_init_data(self.vm, {**self.settings, "root_password": password})
+                self.assertNotIn("secret", str(error.exception))
+
+    def test_root_password_context_precedence_and_explicit_empty_override(self):
+        for host_password, local, expected in (
+            (None, {}, "CLUSTER_SECRET"),
+            ("DEVICE_SECRET", {}, "DEVICE_SECRET"),
+            ("DEVICE_SECRET", {"root_password": "VM_SECRET"}, "VM_SECRET"),
+            ("DEVICE_SECRET", {"root_password": ""}, ""),
+        ):
+            with self.subTest(host=host_password, local=local):
+                record = {"device": {"id": 2}, "config_context": {"vmctl": {"cloud_init": {
+                    **self.settings, "root_password": "CLUSTER_SECRET"}}},
+                    "local_context_data": {"vmctl": {"cloud_init": local}}}
+                host = {"local_context_data": {"vmctl": {"cloud_init": {
+                    "root_password": host_password}}}} if host_password else {}
+                with patch("cloudinit._request", return_value=host), \
+                        patch("cloudinit.root_ssh_authorized_keys", return_value=self.settings["root_ssh_authorized_keys"]), \
+                        patch("cloudinit.context_names", return_value={"available": False, "matched": [], "unresolved": []}):
+                    data = cloudinit.cloud_init_from_netbox({}, record, self.vm)
+                user = json.loads(data["user-data"].split("\n", 1)[1])
+                if expected:
+                    self.assertEqual(user["chpasswd"]["users"][0]["password"], expected)
+                else:
+                    self.assertEqual(user["runcmd"], [["passwd", "-d", "root"]])
+                self.assertNotIn("root_password", self.vm["creation_report"]["ignored_fields"])
+                self.assertNotIn("SECRET", json.dumps(self.vm["creation_report"]))
+
+    def test_legacy_root_password_is_rejected_with_migration_hint(self):
+        for context in ({"root_password": "SECRET"},
+                        {"root_password": "SECRET", "cloud_init": {"root_password": "NEW_SECRET"}}):
+            record = {"local_context_data": {"vmctl": context}}
+            with self.subTest(context=context):
+                with self.assertRaisesRegex(netbox.NetBoxError, "move vmctl.root_password to vmctl.cloud_init.root_password") as error:
+                    cloudinit.cloud_init_from_netbox({}, record, self.vm)
+                self.assertNotIn("SECRET", str(error.exception))
 
     def test_bridge_route_is_gateway_not_bridge_address(self):
         routes = '[{"gateway":"192.0.2.1"},{"gateway":"198.51.100.1"}]'
@@ -127,6 +189,8 @@ class CloudInitTests(unittest.TestCase):
 
             def run(command, **kwargs):
                 calls.append(command)
+                if command[0] == "xorriso":
+                    Path(command[command.index("-o") + 1]).write_bytes(b"seed")
                 if command[0] == "virt-install":
                     return SimpleNamespace(stdout=vmcreate.domain_xml(
                         vm, project / "guest.qcow2", "br0", Path("/tmp/temporary.iso")))
@@ -142,7 +206,9 @@ class CloudInitTests(unittest.TestCase):
             seed_dir = project / "state/cloud-init/guest"
             for name, expected in vm["cloud_init_data"].items():
                 self.assertEqual((seed_dir / name).read_text(), expected)
+                self.assertEqual((seed_dir / name).stat().st_mode & 0o777, 0o600)
             self.assertEqual(seed_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((project / "guest-seed.iso").stat().st_mode & 0o777, 0o600)
             xml = ET.parse(project / "state/domains/guest.xml")
             self.assertEqual(xml.find("./devices/disk[@device='cdrom']/source").get("file"),
                              str(project / "guest-seed.iso"))
@@ -182,10 +248,13 @@ class CloudInitTests(unittest.TestCase):
                         patch("netbox.interface_ips", return_value=[{"id": 20, "address": "192.0.2.10/24"}]):
                     spec = netbox.local_spec_from_netbox(record, config)
                 self.assertEqual(spec["image"], vm["image"])
+                self.assertEqual(spec["hardware"], vm["hardware"])
                 data = cloudinit.cloud_init_data(spec, self.settings)
                 user = json.loads(data["user-data"].split("\n", 1)[1])
                 self.assertEqual(user["users"][0]["name"], "root")
                 self.assertEqual(user["users"][0]["ssh_authorized_keys"], self.settings["root_ssh_authorized_keys"])
+                self.assertFalse(user["ssh_pwauth"])
+                self.assertIn(["passwd", "-d", "root"], user["runcmd"])
                 self.assertNotIn("system_info", user)  # The image selects its own distro/backend.
                 self.assertEqual(json.loads(data["meta-data"])["local-hostname"], vm["name"])
                 network = json.loads(data["network-config"])

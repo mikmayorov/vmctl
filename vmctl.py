@@ -46,6 +46,8 @@ def error_hint(error: Exception, command: str, name: str | None = None) -> str:
         return f"Для новой ВМ выполните vmctl --dry-run create {target}, затем vmctl create {target}."
     if command == "create" and "does not exist in netbox" in detail:
         return "Сначала выполните vmctl prepare ФАЙЛ.toml, настройте запись в NetBox и повторите create ИМЯ."
+    if "root_password" in detail:
+        return "Задайте строковое поле vmctl.cloud_init.root_password в Context; пустая строка означает пустой пароль консоли."
     if ("cloud image dependencies missing" in detail or "is required for cloud images" in detail
             or "virt-install --cloud-init needs" in detail
             or (isinstance(error, FileNotFoundError)
@@ -1327,6 +1329,8 @@ def create_command(config: dict, args: argparse.Namespace) -> int:
     status = desired_vm_status(record)
     vm = validate_spec({"vm": local_spec_from_netbox(record, config)})
     vm["uuid"] = serial
+    vm["creation_report"] = {"cluster": record.get("cluster") or {"id": cluster_id},
+                             "device": record.get("device") or {"id": device_id}}
     if vm["source"] == "cloud_image":
         vm["cloud_init_data"] = cloud_init_from_netbox(config, record, vm)
     result = create_vm(vm, config, Path(__file__).parent, args.dry_run)

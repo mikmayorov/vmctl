@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from creation_report import print_creation_summary
 
 
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -490,6 +491,7 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
         seed_cmd.append(f"network-config={seed_dir / 'network-config'}")
     cloud_command = cloud_install_command(vm, uri, wanted_disks, seed_dir) if seed else None
     define_cmd = ["virsh", "-c", uri, "define", str(xml_path)]
+    print_creation_summary(vm, dry_run)
     print(f"Source: {vm['iso'] if vm['source'] == 'iso' else vm['image']}")
     print(f"Bridge: {bridge}")
     print(f"Domain XML: {xml_path}")
@@ -582,7 +584,11 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
             if name not in ("user-data", "meta-data", "network-config"):
                 raise ValueError(f"unsupported cloud-init file: {name}")
             (seed_dir / name).write_text(content, encoding="utf-8")
+            (seed_dir / name).chmod(0o600)
+        descriptor = os.open(seed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
         subprocess.run(seed_cmd, check=True)
+        seed.chmod(0o600)
     xml = domain_xml(vm, disk, bridge, seed)
     if cloud_command:
         try:
@@ -596,6 +602,8 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
     os.replace(temporary_xml, xml_path)
     subprocess.run(define_cmd, check=True)
     print(f"VM defined: {vm['name']}. Start it with: vmctl start {vm['name']}")
+    if seed:
+        print("Cloud-init seed записан; применение настроек внутри гостя ещё не проверено — ВМ не запускалась.")
     return 0
 
 

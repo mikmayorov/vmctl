@@ -53,6 +53,8 @@
 #    из hardware и подключит постоянный NoCloud seed с настройками из NetBox.
 #    Исходный образ не изменяется. virt-install --cloud-init формирует XML
 #    первого запуска; vmctl определяет ВМ без её запуска.
+#    Сводка create покажет ресурсы, образ, источники Context и итоговые IP,
+#    шлюзы/DNS. Для имён Config Contexts нужно необязательное view extras.configcontext.
 #
 # 6. Запустите ВМ и проверьте состояние:
 #      vmctl start example-ubuntu
@@ -76,6 +78,14 @@
 # Cloud-init задаёт hostname, ключи root и статическую сеть, отключает вход
 # по SSH-паролю и расширяет корневую файловую систему. Последующие sync
 # существующей ВМ не пересоздают seed и не обновляют ключи/сеть внутри гостя.
+# Пароль консоли задаётся в Context как vmctl.cloud_init.root_password (строка).
+# Если поля нет или оно равно "", cloud-init выполнит passwd -d root на
+# финальном этапе первого запуска для консольного входа без пароля.
+#   virsh -c qemu:///system console example-ubuntu
+# Введите root в login: и заданный пароль, если он не пустой; выход — Ctrl + ].
+# SSH остаётся по ключам. До настройки cloud-init пароль root заблокирован.
+# Для существующей ВМ используйте passwd root или passwd -d root вручную;
+# sync пароль не меняет.
 # После prepare источником параметров становится NetBox, а не этот TOML.
 # Если создание прервалось после записи диска, проверьте оставшиеся файлы:
 # vmctl намеренно не перезаписывает существующий диск cloud image при повторе.
@@ -141,6 +151,7 @@ image = "/var/lib/libvirt/images-ro/ubuntu-26.04-server-cloudimg-amd64v3.img"
 # {
 #   "vmctl": {
 #     "cloud_init": {
+#       "root_password": "",
 #       "dns_servers": ["192.0.2.53", "2001:db8::53"],
 #       "search_domains": ["example.org"],
 #       "network": {
@@ -156,6 +167,10 @@ image = "/var/lib/libvirt/images-ro/ubuntu-26.04-server-cloudimg-amd64v3.img"
 #   }
 # }
 #
+# root_password расположен внутри vmctl.cloud_init. Непустая строка
+# задаёт пароль консоли; отсутствие поля или "" выбирает пустой пароль.
+# Пустая строка ВМ переопределяет унаследованный пароль; null не допускается.
+# Значение хранится открытым текстом в NetBox и user-data/seed, но не печатается.
 # - IP с префиксами здесь не дублируются: они читаются из NetBox IPAM отдельно
 #   для каждого VM Interface. DHCP и принятие IPv6 RA отключены.
 # - Ключи network — имена VM Interfaces. Для общих настроек сегмента можно
