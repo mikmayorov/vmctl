@@ -232,9 +232,13 @@ def verify_local_vm(vm: dict, config: dict, live: bool = False) -> None:
         check=True, capture_output=True, text=True,
     )
     root = ET.fromstring(result.stdout)
-    memory = root.find("./memory")
+    memory = root.find("./currentMemory")
+    if memory is None:
+        memory = root.find("./memory")
     units = {"KiB": 1 / 1024, "MiB": 1, "GiB": 1024}
     actual_memory = int(memory.text) * units.get(memory.get("unit", "KiB"), 0) if memory is not None else None
+    vcpu = root.find("./vcpu")
+    actual_vcpus = (vcpu.get("current") or vcpu.text) if vcpu is not None else None
     directory = vm.get("storage_directory") or config.get("storage", {}).get("directory", "/")
     expected_disk = str(Path(directory) / f"{vm['name']}.qcow2")
     expected_media = (vm["iso"] if vm["source"] == "iso" else
@@ -282,7 +286,7 @@ def verify_local_vm(vm: dict, config: dict, live: bool = False) -> None:
         root.findtext("./name") != vm["name"]
         or (vm.get("uuid") and root.findtext("./uuid") != vm["uuid"])
         or actual_memory != vm["memory_mb"]
-        or root.findtext("./vcpu") != str(vm["vcpus"])
+        or actual_vcpus != str(vm["vcpus"])
         or not disk_match
         or (expected_media is not None and not any(item.get("file") == expected_media for item in cdroms))
         or not interface_match
@@ -290,6 +294,59 @@ def verify_local_vm(vm: dict, config: dict, live: bool = False) -> None:
         or not display_matches
     ):
         raise ValueError(f"local VM {vm['name']} differs from its NetBox definition")
+
+
+def _image_info(path: Path) -> dict:
+    try:
+        result = subprocess.run(["qemu-img", "info", "--output=json", str(path)],
+                                check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip() or str(error)
+        raise ValueError(f"qemu-img info failed for {path}: {detail}") from error
+    return json.loads(result.stdout)
+
+
+def _live_disk_info(config: dict, name: str, disk: ET.Element) -> dict:
+    target, driver = disk.find("target"), disk.find("driver")
+    if target is None or not target.get("dev") or driver is None or not driver.get("type"):
+        raise ValueError(f"cannot read live disk target/format for {name}")
+    try:
+        result = subprocess.run(
+            ["virsh", "-c", config["host"]["libvirt_uri"], "domblkinfo", name, target.get("dev")],
+            check=True, capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"},
+        )
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip() or str(error)
+        raise ValueError(f"cannot read live disk capacity for {name}/{target.get('dev')}: {detail}") from error
+    capacity = next((line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
+                     if line.startswith("Capacity:")), None)
+    if capacity is None or not capacity.isdecimal():
+        raise ValueError(f"cannot read live disk capacity for {name}/{target.get('dev')}")
+    return {"format": driver.get("type"), "virtual-size": int(capacity)}
+
+
+def _set_startup_resources(root: ET.Element, vm: dict) -> None:
+    topology = root.find("./cpu/topology")
+    if topology is not None:
+        other = 1
+        for field in ("sockets", "dies", "clusters", "threads"):
+            count = int(topology.get(field, "1"))
+            if count <= 0:
+                raise ValueError("invalid CPU topology")
+            other *= count
+        if vm["vcpus"] != other * int(topology.get("cores", "1")):
+            if vm["vcpus"] % other:
+                raise ValueError("requested vCPUs do not fit existing CPU topology; adjust sockets/dies/clusters/threads first")
+            topology.set("cores", str(vm["vcpus"] // other))
+    for tag in ("memory", "currentMemory"):
+        node = root.find(tag)
+        if node is not None:
+            node.text = str(vm["memory_mb"])
+            node.set("unit", "MiB")
+    vcpu = root.find("vcpu")
+    vcpu.text = str(vm["vcpus"])
+    if vcpu.get("current") is not None:
+        vcpu.set("current", str(vm["vcpus"]))
 
 
 def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge: bool = False,
@@ -324,14 +381,25 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
         existing_disks[source.get("file") or source.get("dev")] = node
         used_targets.add(target.get("dev"))
     removed_paths = set(existing_disks) - desired_paths
+    live_disks = None
     for item in desired_disks:
         path = Path(item["path"])
         if vm["source"] == "existing" and item["path"] in existing_disks:
             continue
         if path.exists():
-            info = subprocess.run(["qemu-img", "info", "--output=json", str(path)],
-                                  check=True, capture_output=True, text=True)
-            disk_info = json.loads(info.stdout)
+            if state != "shut off" and live_disks is None:
+                live_xml = subprocess.run(
+                    ["virsh", "-c", uri, "dumpxml", name], check=True, capture_output=True, text=True,
+                ).stdout
+                live_disks = {}
+                for node in ET.fromstring(live_xml).findall("./devices/disk[@device='disk']"):
+                    source = node.find("source")
+                    if source is not None:
+                        live_disks[source.get("file") or source.get("dev")] = node
+            if live_disks is not None and item["path"] in live_disks:
+                disk_info = _live_disk_info(config, name, live_disks[item["path"]])
+            else:
+                disk_info = _image_info(path)
             if disk_info.get("format") != "qcow2" or disk_info.get("virtual-size") != item["size_gb"] * 1024**3:
                 raise ValueError(f"local disk differs from NetBox: {path}; resizing is unsupported")
         elif item["path"] in existing_disks:
@@ -397,9 +465,7 @@ def redefine_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool, purge:
     for key, item in wanted.items():
         if key not in used:
             _interface_element(devices, item, vm["name"])
-    root.find("./memory").text = str(vm["memory_mb"])
-    root.find("./memory").set("unit", "MiB")
-    root.find("./vcpu").text = str(vm["vcpus"])
+    _set_startup_resources(root, vm)
     description = root.find("./description")
     if description is None:
         description = ET.Element("description")
@@ -528,11 +594,7 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
             raise ValueError(f"disk must be in managed storage: {item_path}")
         if not item_path.exists():
             continue
-        info = subprocess.run(
-            ["qemu-img", "info", "--output=json", str(item_path)],
-            check=True, capture_output=True, text=True,
-        )
-        existing_disk = json.loads(info.stdout)
+        existing_disk = _image_info(item_path)
         if existing_disk.get("format") != "qcow2" or existing_disk.get("virtual-size") != item["size_gb"] * 1024**3:
             raise ValueError(f"existing disk differs from NetBox: {item_path}")
         if seed and item_path == disk:
@@ -559,11 +621,7 @@ def create_vm(vm: dict, config: dict, project_dir: Path, dry_run: bool) -> int:
         raise ValueError(f"VM already exists in libvirt: {vm['name']}")
 
     if seed:
-        info = subprocess.run(
-            ["qemu-img", "info", "--output=json", str(source_path)],
-            check=True, capture_output=True, text=True,
-        )
-        image_size = json.loads(info.stdout)["virtual-size"]
+        image_size = _image_info(source_path)["virtual-size"]
         if image_size > wanted_disks[0]["size_gb"] * 1024**3:
             raise ValueError("vm.disk_gb is smaller than the cloud image virtual size")
     xml_path.parent.mkdir(parents=True, exist_ok=True)
